@@ -1,0 +1,7 @@
+.iq_option_demo_profile/
+.iq_option_demo_firefox_profile/
+operaciones_demo.sqlite3*
+senales_simuladas.csv
+diagnostico_bot.log*
+__pycache__/
+.venv/
