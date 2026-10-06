@@ -68,6 +68,30 @@ class RegionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.monitor.to_screen((0, 0, 401, 100))
 
+    def test_reset_statistics_keeps_execution_safety_state(self):
+        self.app.ledger = Mock()
+        self.app.ledger.summary.return_value = "zero"
+        self.app.summary_text = Mock()
+        self.app.execution.armed = True
+        self.app.execution.session_losses = 2
+        with patch("bot.messagebox.askyesno", return_value=True):
+            self.app.reset_statistics()
+        self.app.ledger.reset_statistics.assert_called_once_with()
+        self.app.summary_text.set.assert_called_once_with(
+            "zero\nPerdidas de seguridad: 2/3",
+        )
+        self.assertTrue(self.app.execution.armed)
+        self.assertEqual(self.app.execution.session_losses, 2)
+
+    def test_statistics_summary_displays_security_loss_counter(self):
+        self.app.ledger = Mock()
+        self.app.ledger.summary.return_value = "Ganadas: 0"
+        self.app.execution.session_losses = 1
+        self.assertEqual(
+            self.app.statistics_summary(),
+            "Ganadas: 0\nPerdidas de seguridad: 1/3",
+        )
+
     @patch("bot.list_monitors")
     @patch("bot.ImageGrab.grab")
     def test_monitor_capture_uses_virtual_desktop(self, grab, monitors):

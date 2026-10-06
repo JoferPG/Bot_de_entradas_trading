@@ -115,14 +115,24 @@ La base local `operaciones_demo.sqlite3` conserva solicitudes y posiciones
 confirmadas por su ID. `senales_simuladas.csv` sigue siendo solamente el
 registro de detecciones y no confirma que haya habido una operacion.
 
-El panel separa CALL, PUT y TOTAL:
+El panel presenta solo las estadisticas generales desde el ultimo reinicio:
 
-- Operaciones confirmadas por ID, pendientes y cerradas.
-- Importe invertido en posiciones confirmadas.
-- Importe devuelto en posiciones cerradas, leido del campo **Rendimiento**
-  de los detalles de la interfaz observada.
-- Neto cerrado = devuelto - inversion de esas posiciones cerradas.
-  No se resta la inversion pendiente como si ya fuese una perdida.
+- Ganadas/Perdidas: cantidad de operaciones cerradas cuyo importe devuelto
+  fue mayor/menor que la inversion. Un empate no cuenta como ninguna.
+- Neto invertido: suma de las inversiones de operaciones cerradas.
+- Ingresos: suma de importes devueltos en operaciones cerradas, leidos del
+  campo **Rendimiento** de los detalles observados.
+- Perdidas: monto no recuperado en las operaciones con devolucion menor que
+  su inversion.
+
+El boton **REINICIAR ESTADISTICAS** confirma antes de poner el corte
+estadistico en la hora actual. No borra operaciones de `operaciones_demo.sqlite3`
+ni operaciones abiertas/inciertas; el historial permanece para exportacion
+posterior. Tampoco reinicia el limite de tres perdidas de la activacion ni
+arma/desarma el bot. El saldo de cuenta no se contabiliza.
+El panel tambien muestra por separado **Perdidas de seguridad: n/3**.
+Este contador se reinicia al volver a armar la ejecucion, no al reiniciar
+las estadisticas visibles.
 
 El saldo de la cuenta y las operaciones previas al armado no se contabilizan.
 Los datos no interpretables no se sustituyen por cero. No se calcula una

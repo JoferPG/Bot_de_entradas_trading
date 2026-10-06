@@ -93,6 +93,14 @@ class Ledger:
         if "deadline" not in columns:
             self.db.execute("ALTER TABLE demo_orders ADD COLUMN deadline REAL")
             self.db.commit()
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS statistics_state "
+            "(id INTEGER PRIMARY KEY CHECK(id=1), reset_at REAL NOT NULL)"
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO statistics_state(id, reset_at) VALUES(1, 0)"
+        )
+        self.db.commit()
 
     def pending(self) -> sqlite3.Row | None:
         return self.db.execute(
@@ -180,23 +188,51 @@ class Ledger:
             raise ValueError("Posicion cerrada sin devolucion legible.")
         return Decimal(row["returned"]) < Decimal(row["stake"])
 
-    def summary(self) -> str:
-        rows = self.db.execute("SELECT * FROM demo_orders ORDER BY id").fetchall()
-        lines = ["DEMO ($): operaciones confirmadas / pendientes / cierres"]
-        for direction in ("CALL", "PUT", "TOTAL"):
-            selected = [r for r in rows if direction == "TOTAL" or r["direction"] == direction]
-            confirmed = [r for r in selected if r["position_id"]]
-            closed = [r for r in selected if r["status"] == "CLOSED"]
-            pending = [r for r in selected if r["status"] in ("REQUESTED", "UNKNOWN", "OPEN")]
-            invested = sum((Decimal(r["stake"]) for r in confirmed), Decimal(0))
-            returned = sum((Decimal(r["returned"]) for r in closed), Decimal(0))
-            closed_stake = sum((Decimal(r["stake"]) for r in closed), Decimal(0))
-            lines.append(
-                f"{direction}: {len(confirmed)} / {len(pending)} / {len(closed)}\n"
-                f"Invertido ${invested:.2f} | Devuelto ${returned:.2f} | "
-                f"Neto cerrado ${returned - closed_stake:.2f}"
+    def reset_statistics(self, reset_at: float | None = None) -> None:
+        timestamp = time.time() if reset_at is None else reset_at
+        if not math.isfinite(timestamp):
+            raise ValueError("Fecha invalida para reiniciar estadisticas.")
+        with self.db:
+            self.db.execute(
+                "UPDATE statistics_state SET reset_at=? WHERE id=1",
+                (timestamp,),
             )
-        return "\n".join(lines)
+
+    def summary(self) -> str:
+        reset_at = self.db.execute(
+            "SELECT reset_at FROM statistics_state WHERE id=1",
+        ).fetchone()["reset_at"]
+        rows = self.db.execute(
+            "SELECT * FROM demo_orders WHERE created >= ? AND status='CLOSED' ORDER BY id",
+            (reset_at,),
+        ).fetchall()
+        wins = [
+            row for row in rows
+            if row["returned"] is not None and Decimal(row["returned"]) > Decimal(row["stake"])
+        ]
+        losses = [
+            row for row in rows
+            if row["returned"] is not None and Decimal(row["returned"]) < Decimal(row["stake"])
+        ]
+        invested = sum((Decimal(row["stake"]) for row in rows), Decimal(0))
+        income = sum(
+            (Decimal(row["returned"]) for row in rows if row["returned"] is not None),
+            Decimal(0),
+        )
+        losses_amount = sum(
+            (
+                Decimal(row["stake"]) - Decimal(row["returned"])
+                for row in losses if row["returned"] is not None
+            ),
+            Decimal(0),
+        )
+        return "\n".join((
+            f"Ganadas: {len(wins)}",
+            f"Perdidas: {len(losses)}",
+            f"Neto invertido: ${invested:.2f}",
+            f"Ingresos: ${income:.2f}",
+            f"Perdidas: ${losses_amount:.2f}",
+        ))
 
     def close(self) -> None:
         self.db.close()

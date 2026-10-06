@@ -573,7 +573,7 @@ class App:
         self.ledger = Ledger(Path(__file__).with_name("operaciones_demo.sqlite3"))
         self.execution = DemoExecution(self.browser, self.ledger)
         self.order_status = tk.StringVar(value="Ejecucion DESARMADA: solo avisos")
-        self.summary_text = tk.StringVar(value=self.ledger.summary())
+        self.summary_text = tk.StringVar(value=self.statistics_summary())
         self.result_job: str | None = None
         self.monitors = list_monitors()
         self.monitor_index = 0
@@ -645,6 +645,10 @@ class App:
         tk.Button(content, text="DETENER (Esc)", command=self.stop).pack(pady=5)
         tk.Label(content, textvariable=self.order_status, wraplength=430).pack(pady=3)
         tk.Label(content, textvariable=self.summary_text, justify="left").pack(pady=3)
+        tk.Button(
+            content, text="REINICIAR ESTADISTICAS (conservar historial)",
+            command=self.reset_statistics,
+        ).pack(pady=3)
         self.signal_panel = tk.Label(
             content, textvariable=self.signal_text, font=("Arial", 16, "bold"),
             fg="gray",
@@ -672,6 +676,12 @@ class App:
         self.status.set(
             "Apertura de IQ Option solicitada en ventana dedicada. Inicia sesion manualmente, "
             "selecciona cuenta demo y calibra el grafico antes de iniciar."
+        )
+
+    def statistics_summary(self) -> str:
+        return (
+            f"{self.ledger.summary()}\n"
+            f"Perdidas de seguridad: {self.execution.session_losses}/3"
         )
 
     def change_monitor(self, _event: tk.Event | None = None) -> None:
@@ -951,7 +961,7 @@ class App:
                     self.order_status.set(
                         "Clic enviado; esperando confirmar posicion. No se repetira."
                     )
-                    self.summary_text.set(self.ledger.summary())
+                    self.summary_text.set(self.statistics_summary())
                     self.schedule_results()
                 else:
                     reason = (
@@ -1048,7 +1058,7 @@ class App:
                 "Resultados consultados: demo_armada=%s perdidas=%s",
                 self.execution.armed, self.execution.session_losses,
             )
-            self.summary_text.set(self.ledger.summary())
+            self.summary_text.set(self.statistics_summary())
             if self.ledger.pending() is not None:
                 self.order_status.set("Esperando vencimiento/resultado demo. Sin nuevas entradas.")
                 self.schedule_results()
@@ -1063,9 +1073,31 @@ class App:
             LOGGER.exception("Lectura de resultados fallida; demo desarmada")
             self.execution.armed = False
             self.order_status.set(f"DEMO BLOQUEADA: {exc}")
-            self.summary_text.set(self.ledger.summary())
+            self.summary_text.set(self.statistics_summary())
             # Consultar de nuevo es seguro: nunca vuelve a pulsar una orden.
             self.schedule_results()
+
+    def reset_statistics(self) -> None:
+        if not messagebox.askyesno(
+            "Reiniciar estadisticas",
+            "Poner a cero las estadisticas desde ahora? El historial y las "
+            "operaciones pendientes o inciertas se conservaran. No se "
+            "reiniciara el limite de seguridad de perdidas ni se armara el bot.",
+        ):
+            return
+        try:
+            self.ledger.reset_statistics()
+            self.summary_text.set(self.statistics_summary())
+            LOGGER.info(
+                "Estadisticas reiniciadas; historial conservado; demo_armada=%s perdidas_activacion=%s",
+                self.execution.armed, self.execution.session_losses,
+            )
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            LOGGER.exception("No se pudieron reiniciar las estadisticas")
+            messagebox.showerror(
+                "No se pudieron reiniciar las estadisticas",
+                "El registro no cambio. Revisa el diagnostico local.",
+            )
 
     def stop(self) -> None:
         LOGGER.info("DETENER: detector detenido y ejecucion desarmada")

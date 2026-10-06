@@ -454,7 +454,11 @@ class DemoTests(unittest.TestCase):
         self.browser.positions.return_value = [self.position(closed=True, returned=Decimal("37.40"))]
         self.refresh_after_expiry()
         self.assertIsNone(self.ledger.pending())
-        self.assertIn("Neto cerrado $17.40", self.ledger.summary())
+        self.assertIn("Ganadas: 1", self.ledger.summary())
+        self.assertIn("Perdidas: 0", self.ledger.summary())
+        self.assertIn("Neto invertido: $20.00", self.ledger.summary())
+        self.assertIn("Ingresos: $37.40", self.ledger.summary())
+        self.assertIn("Perdidas: $0.00", self.ledger.summary())
 
     def test_click_failure_is_persistent_unknown_and_never_retried(self):
         self.execution.arm()
@@ -497,7 +501,9 @@ class DemoTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.refresh_after_expiry()
         self.assertEqual(self.ledger.pending()["status"], "REQUESTED")
-        self.assertIn("CALL: 0 / 1 / 0", self.ledger.summary())
+        self.assertIn("Ganadas: 0", self.ledger.summary())
+        self.assertNotIn("CALL:", self.ledger.summary())
+        self.assertNotIn("Pendientes", self.ledger.summary())
 
     def test_losses_pending_and_direction_totals(self):
         first = self.ledger.reserve("CALL", self.settings, set(), "a")
@@ -505,11 +511,16 @@ class DemoTests(unittest.TestCase):
         self.ledger.reserve("PUT", self.settings, {"call"}, "b")
         self.ledger.reconcile([self.position("put", True, Decimal("37.40"), "PUT")])
         summary = self.ledger.summary()
-        self.assertIn("CALL: 1 / 0 / 1", summary)
-        self.assertIn("PUT: 1 / 0 / 1", summary)
-        self.assertIn("TOTAL: 2 / 0 / 2", summary)
-        self.assertIn("Neto cerrado $-2.60", summary)
-        self.assertIn("Invertido $40.00", summary)
+        self.assertEqual(summary.count("Ganadas:"), 1)
+        self.assertEqual(summary.count("Perdidas:"), 2)
+        self.assertIn("Ganadas: 1", summary)
+        self.assertIn("Perdidas: 1", summary)
+        self.assertIn("Neto invertido: $40.00", summary)
+        self.assertIn("Ingresos: $37.40", summary)
+        self.assertIn("Perdidas: $20.00", summary)
+        self.assertNotIn("CALL:", summary)
+        self.assertNotIn("PUT:", summary)
+        self.assertNotIn("TOTAL:", summary)
         self.assertIsInstance(first, int)
 
     def test_missing_return_and_duplicate_signal_do_not_change_totals(self):
@@ -520,7 +531,8 @@ class DemoTests(unittest.TestCase):
         import sqlite3
         with self.assertRaises(sqlite3.IntegrityError):
             self.ledger.reserve("CALL", self.settings, set(), "unique")
-        self.assertIn("TOTAL: 1 / 0 / 1", self.ledger.summary())
+        self.assertIn("Ganadas: 0", self.ledger.summary())
+        self.assertIn("Perdidas: 1", self.ledger.summary())
 
     def test_start_does_not_navigate_to_history(self):
         self.browser.positions.return_value = [self.position()]
@@ -542,7 +554,37 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.browser.click_once.call_count, 25)
         self.assertTrue(self.execution.armed)
         self.assertIsNone(self.ledger.pending())
-        self.assertIn("TOTAL: 25 / 0 / 25", self.ledger.summary())
+        self.assertIn("Ganadas: 25", self.ledger.summary())
+        self.assertIn("Perdidas: 0", self.ledger.summary())
+
+    def test_reset_statistics_keeps_history_and_pending_safety_record(self):
+        with patch("demo_execution.time.time", return_value=1_800_000_000):
+            self.ledger.reserve("CALL", self.settings, set(), "closed-before-reset")
+        self.ledger.reconcile([self.position("closed", True, Decimal(0))])
+        with patch("demo_execution.time.time", return_value=1_800_000_010):
+            pending_id = self.ledger.reserve("PUT", self.settings, set(), "pending-before-reset")
+        self.ledger.reset_statistics(1_800_000_020)
+        summary = self.ledger.summary()
+        self.assertIn("Ganadas: 0", summary)
+        self.assertIn("Perdidas: 0", summary)
+        self.assertIn("Neto invertido: $0.00", summary)
+        self.assertIn("Ingresos: $0.00", summary)
+        self.assertIn("Perdidas: $0.00", summary)
+        self.assertNotIn("Pendientes", summary)
+        self.assertEqual(self.ledger.pending()["id"], pending_id)
+        self.assertEqual(
+            self.ledger.db.execute("SELECT COUNT(*) FROM demo_orders").fetchone()[0], 2,
+        )
+        self.ledger.reconcile([
+            self.position("pending-closed", True, Decimal(0), "PUT"),
+        ])
+        with patch("demo_execution.time.time", return_value=1_800_000_030):
+            self.ledger.reserve("CALL", self.settings, set(), "closed-after-reset")
+        self.ledger.reconcile([self.position("after-reset", True, Decimal("37.40"))])
+        updated = self.ledger.summary()
+        self.assertIn("Ganadas: 1", updated)
+        self.assertIn("Neto invertido: $20.00", updated)
+        self.assertIn("Ingresos: $37.40", updated)
 
     def test_three_total_losses_stop_even_with_wins_between(self):
         self.execution.arm()
