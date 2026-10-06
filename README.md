@@ -69,11 +69,18 @@ aparece en el monitor elegido; admite pantallas a la izquierda o arriba
 del principal (coordenadas negativas) y captura solo la zona seleccionada.
 Puedes colocar el panel del bot en otra pantalla.
 La vista previa muestra cada nueva captura del grafico durante el
-seguimiento normal (intervalo de 200 ms mas el tiempo de procesamiento),
+seguimiento normal (intervalo de 100 ms mas el tiempo de procesamiento),
 sin parpadeo. El marco blanco sigue la vela actual identificada.
 Las lineas se dibujan despues de reducir la vista para conservar su grosor.
-Blanco indica la franja identificada de la vela actual. No se exige
-movimiento del cuerpo/mecha. Si no se identifica una secuencia fiable,
+Blanco indica una franja estrecha centrada en el punto blanco de precio.
+Primero se busca un unico nucleo blanco compacto de 4 a 12 pixeles por eje
+(RGB de 229 a 255 por canal). Se excluye el brillo tenue que puede unirlo
+a un segmento discontinuo. La linea horizontal debe tener soporte y
+contraste con el fondo a ambos lados; puede cambiar de color entre lados.
+El punto sirve de ancla para escoger la serie de velas y debe estar alineado con el centro
+de la ultima vela de la secuencia (tolerancia maxima de 3 pixeles).
+No se exige movimiento del cuerpo/mecha. Si falta el punto, hay varios
+candidatos, no coincide con la vela o no se identifica una secuencia fiable,
 se muestra el grafico sin lineas y se bloquean las entradas.
 Si el seguimiento indica que la nueva vela aun no es identificable, la
 vista en vivo continua sin marco; no se emiten senales ni entradas hasta
@@ -87,7 +94,12 @@ Una flecha CALL/PUT nueva dentro de la franja actual puede habilitar una
 entrada aunque el cuerpo de la vela este quieto. Se mantienen dos capturas
 sin flecha para rearmar, tres capturas consecutivas de reconocimiento y
 como maximo una senal por intervalo. Las flechas presentes al iniciar y
-las de velas anteriores no provocan entradas. Se conservan las comprobaciones
+las centradas fuera de la referencia no habilitan entradas. Un desplazamiento
+del punto mayor de 3 pixeles reinicia el rearme; antes de solicitar la orden
+se toma otra captura y se exige el mismo punto y direccion de flecha.
+La comprobacion es visual, no prueba la hora de la vela ni garantiza ausencia
+de falsos positivos. Los limites de tamano se deben verificar con el zoom
+real; no se relajan automaticamente tras errores. Se conservan las comprobaciones
 de cuenta DEMO, configuracion, vencimiento y solicitud pendiente.
 
 Cambiar de monitor detiene y desarma el bot y borra las muestras y la zona.
@@ -174,13 +186,23 @@ una flecha que solo alterna entre reconocida y rechazada. Se mantienen tres
 capturas consecutivas y el bloqueo de flechas ya visibles al cambiar de vela.
 El umbral del 70 % permite mayor variacion de forma, pero aumenta el riesgo
 de aceptar figuras que no sean flechas respecto al umbral anterior del 88 %.
-Las tres capturas usan ahora pausas de 200 ms: al menos 400 ms entre la
+Las tres capturas usan ahora pausas de 100 ms: al menos 200 ms entre la
 primera y la tercera, mas el procesamiento. Las mascaras de color se
-calculan con Pillow; la mascara de velas identifica la franja actual. Si Tiempo ya coincide con el cierre, no se repite la lectura
-completa de configuracion durante su preparacion; se conserva la lectura
+calculan con Pillow; la mascara de velas valida la posicion del punto blanco.
+La preparacion reutiliza la configuracion recien leida por submit; si se
+cambia Tiempo, vuelve a leerla despues del ajuste. Si Tiempo ya coincide
+con el cierre, no se repite la lectura completa durante su preparacion.
+Se conserva la lectura
 inicial y la comprobacion completa inmediatamente antes del clic.
 Esto reduce trabajo, pero no extiende el horario de compra que permite
 IQ Option ni sustituye un vencimiento no disponible por otro.
+El diagnostico mide por separado la lectura de configuracion, preparacion
+de vencimiento y validacion final/clic. Distingue una senal de mas de 6
+segundos de una vela que ya cerro. No cambia el momento en que el indicador
+genera la flecha ni limita nuevas senales a los primeros segundos de la vela.
+El limite de antiguedad es de 6 segundos al recibir la solicitud y al
+terminar la preparacion; no introduce una espera obligatoria. Se conserva
+el bloqueo cuando quedan dos segundos o menos para el cierre.
 Tras reiniciar pulsa INICIAR: si existe una solicitud pendiente, las
 entradas quedan bloqueadas y su validacion se programa automaticamente.
 Una vez resuelta, vuelve a pulsar INICIAR para activar nuevas entradas.

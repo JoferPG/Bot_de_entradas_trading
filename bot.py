@@ -8,7 +8,8 @@ El inicio de sesion y la seleccion de cuenta demo son manuales.
 Calibrar dos flechas historicas como muestras, confirmar sus vistas previas
 y seleccionar el area del grafico. Se filtran botones anchos y elementos
 aislados buscando una secuencia de al menos tres velas con espaciado regular.
-Se sigue la vela visible mas a la derecha y se filtran flechas por su centro.
+Se exige un punto blanco sobre una linea de precio alineado con la vela
+mas reciente; no se usa una vela historica si falta esta referencia.
 El grafico debe estar en tiempo real; no se puede verificar esto por imagen.
 Los colores de velas son configurables y distintos de los de las flechas.
 Mantener el grafico visible y sin cambiar activo, periodo, zoom o posicion.
@@ -50,7 +51,7 @@ COLORS: dict[Signal, tuple[int, int, int]] = {
 }
 COLOR_TOLERANCE = 24
 MIN_SCORE = 0.70
-CAPTURE_INTERVAL_MS = 200
+CAPTURE_INTERVAL_MS = 100
 IQ_OPTION_URL = "https://iqoption.com/traderoom"
 CSV_FIELDS = (
     "observed_at_utc", "asset_declared", "timeframe_seconds",
@@ -265,7 +266,61 @@ def track_candle(
     return _track_mask(candle_mask(image, colors))
 
 
-def _track_mask(mask: Image.Image) -> tuple[float, float]:
+def current_candle_reference(
+    image: Image.Image, colors: tuple[tuple[int, int, int], tuple[int, int, int]],
+) -> tuple[float, float]:
+    dot = white_price_point(image)
+    band = _track_mask(candle_mask(image, colors), anchor=dot)
+    center = sum(band) / 2
+    spacing = band[1] - band[0]
+    tolerance = min(3.0, spacing * 0.12)
+    if abs(dot - center) > tolerance:
+        raise TrackingUnavailable(
+            "Esperando: punto blanco no coincide con la ultima vela. Sin entrada."
+        )
+    return (dot - tolerance, dot + tolerance)
+
+
+def white_price_point(image: Image.Image) -> float:
+    rgb = image.convert("RGB")
+    candidates: list[float] = []
+    for shape in components(rgb, "CALL", color=(255, 255, 255), tolerance=26):
+        if not (4 <= shape.width <= 12 and 4 <= shape.height <= 12):
+            continue
+        if max(shape.width, shape.height) > min(shape.width, shape.height) * 1.5:
+            continue
+        if not 0.45 <= len(shape.pixels) / (shape.width * shape.height) <= 0.95:
+            continue
+        x = shape.origin[0] + (shape.width - 1) / 2
+        y = shape.origin[1] + (shape.height - 1) / 2
+        supported = False
+        for row in range(max(0, round(y) - 3), min(rgb.height, round(y) + 4)):
+            left_support = 0
+            right_support = 0
+            for distance in range(8, 25):
+                left, right = round(x) - distance, round(x) + distance
+                if left < 0 or right >= rgb.width or row + 6 >= rgb.height:
+                    continue
+                a, b = rgb.getpixel((left, row)), rgb.getpixel((right, row))
+                below_a = rgb.getpixel((left, row + 6))
+                below_b = rgb.getpixel((right, row + 6))
+                if max(a) >= 100 and max(abs(a[i] - below_a[i]) for i in range(3)) >= 40:
+                    left_support += 1
+                if max(b) >= 100 and max(abs(b[i] - below_b[i]) for i in range(3)) >= 40:
+                    right_support += 1
+            if left_support >= 12 and right_support >= 12:
+                supported = True
+                break
+        if supported:
+            candidates.append(x)
+    if len(candidates) != 1:
+        raise TrackingUnavailable(
+            "Esperando: punto blanco de precio ausente o ambiguo. Sin entrada."
+        )
+    return candidates[0]
+
+
+def _track_mask(mask: Image.Image, anchor: float | None = None) -> tuple[float, float]:
     columns: list[int] = []
     for x in range(mask.width):
         if mask.crop((x, 0, x + 1, mask.height)).histogram()[255] >= 1:
@@ -316,6 +371,15 @@ def _track_mask(mask: Image.Image) -> tuple[float, float]:
             "Esperando seguimiento: no hay tres velas separadas con espaciado "
             "regular. Verifica colores y que el grafico este visible."
         )
+    if anchor is not None:
+        sequences = [
+            sequence for sequence in sequences
+            if abs((sequence[-1][0] + sequence[-1][-1]) / 2 - anchor) <= 3
+        ]
+        if not sequences:
+            raise TrackingUnavailable(
+                "Esperando: punto blanco no coincide con una vela de la serie. Sin entrada."
+            )
     sequences.sort(key=len, reverse=True)
     if len(sequences) > 1 and len(sequences[0]) == len(sequences[1]):
         raise TrackingUnavailable(
@@ -802,6 +866,7 @@ class App:
         LOGGER.info("DEMO ACTIVADA AL INICIAR; intervalo=%s; perdidas por activacion=0", period)
         self.order_status.set("DEMO ACTIVA: esperando una nueva senal validada")
         self.gate = gate
+        self.last_reference_center = None
         self.tick()
 
     def tick(self) -> None:
@@ -812,7 +877,7 @@ class App:
                 raise RuntimeError("Monitor desconectado o cambiado. Recalibra antes de reiniciar.")
             image = ImageGrab.grab(bbox=self.region, all_screens=True)
             try:
-                candle_range = track_candle(image, self.candle_colors)
+                candle_range = current_candle_reference(image, self.candle_colors)
             except TrackingUnavailable:
                 preview = make_preview(image, None, "white")
                 self.update_preview(preview)
@@ -830,6 +895,14 @@ class App:
             preview = make_preview(image, candle_range, "white")
             self.update_preview(preview)
             timestamp = time.time()
+            reference_center = sum(candle_range) / 2
+            previous_center = getattr(self, "last_reference_center", None)
+            if previous_center is not None and abs(reference_center - previous_center) > 3:
+                self.gate.absent = 0
+                self.gate.armed = False
+                self.gate.candidate = None
+                self.gate.consecutive = 0
+            self.last_reference_center = reference_center
             if detection is None and diagnostics:
                 self.gate.absent = 0
                 self.gate.candidate = None
@@ -849,15 +922,27 @@ class App:
             if registered and detection is not None:
                 pending = self.ledger.pending()
                 LOGGER.info(
-                    "Senal %s validada score=%.3f demo_armada=%s pendiente=%s",
+                    "Senal %s validada score=%.3f demo_armada=%s pendiente=%s punto_blanco_x=%.1f franja=%s",
                     detection.signal, detection.score, self.execution.armed,
                     pending["id"] if pending is not None else None,
+                    reference_center, candle_range,
                 )
                 write_event(
                     self.log_path, self.running_asset, self.running_period,
                     timestamp, detection,
                 )
                 if self.execution.armed and pending is None:
+                    fresh = ImageGrab.grab(bbox=self.region, all_screens=True)
+                    fresh_range = current_candle_reference(fresh, self.candle_colors)
+                    fresh_detection = detect(fresh, self.templates, fresh_range)
+                    if (
+                        abs(sum(fresh_range) / 2 - reference_center) > 2
+                        or fresh_detection is None
+                        or fresh_detection.signal != detection.signal
+                    ):
+                        raise TrackingUnavailable(
+                            "Entrada cancelada: punto blanco o flecha cambio antes del clic."
+                        )
                     LOGGER.info("Intentando entrada %s al cierre; periodo=%s", detection.signal, self.running_period)
                     identity = self.execution.submit(
                         detection.signal, timestamp, self.running_period,
@@ -893,7 +978,7 @@ class App:
                         f"{self.gate.consecutive}/3 capturas consecutivas."
                     )
                 else:
-                    self.status.set("Siguiendo la vela visible mas a la derecha. Sin compras.")
+                    self.status.set("Punto blanco alineado con la vela actual. Sin compras.")
             if detection is not None:
                 reason = (
                     "ya registrada en este intervalo" if self.gate.emitted else
@@ -908,6 +993,11 @@ class App:
                 LOGGER.info("Reconocimiento: %s", report)
                 self.last_detection_report = report
         except TrackingUnavailable as exc:
+            report = f"Entrada bloqueada por referencia: {exc}"
+            if report != getattr(self, "last_detection_report", None):
+                LOGGER.warning("%s", report)
+                self.last_detection_report = report
+            self.last_reference_center = None
             self.gate.absent = 0
             self.gate.armed = False
             self.gate.candidate = None

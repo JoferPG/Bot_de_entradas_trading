@@ -10,8 +10,8 @@ from monitors import Monitor
 from bot import (
     App, COLORS, CSV_FIELDS, IQ_OPTION_URL, Detection, Selector, SignalGate,
     TrackingUnavailable,
-    LOGGER, configure_diagnostics, detect, main, make_preview, parse_color,
-    template_from, track_candle, write_event,
+    LOGGER, configure_diagnostics, current_candle_reference, detect, main, make_preview, parse_color,
+    template_from, track_candle, white_price_point, write_event,
 )
 
 
@@ -201,7 +201,131 @@ class TrackingTests(unittest.TestCase):
         if current_signal:
             arrow = arrow_image(current_signal).crop((10, 10, 27, 27))
             image.paste(arrow, (centers[-1] - 8, 135))
+        draw.line((0, 90, 249, 90), fill="#F0B414")
+        draw.ellipse(
+            (centers[-1] - 3, 87, centers[-1] + 3, 93), fill="white",
+        )
         return image
+
+    def test_white_point_aligns_only_current_arrow(self):
+        for direction in ("CALL", "PUT"):
+            image = self.chart([30, 70, 110], direction)
+            band = current_candle_reference(image, self.colors)
+            self.assertEqual(band, (107, 113))
+            self.assertEqual(detect(image, self.templates, band).signal, direction)
+            historical = self.chart([30, 70, 110])
+            historical.paste(arrow_image(direction).crop((10, 10, 27, 27)), (62, 135))
+            self.assertIsNone(detect(
+                historical, self.templates, current_candle_reference(historical, self.colors),
+            ))
+
+    def test_reference_blocks_missing_ambiguous_or_old_point(self):
+        for scenario in ("missing", "ambiguous", "old", "no_line"):
+            with self.subTest(scenario=scenario):
+                image = self.chart([30, 70, 110], "PUT")
+                draw = ImageDraw.Draw(image)
+                if scenario in ("missing", "old", "no_line"):
+                    draw.rectangle((107, 87, 113, 93), fill=self.colors[0])
+                if scenario in ("old", "ambiguous"):
+                    draw.ellipse((67, 87, 73, 93), fill="white")
+                if scenario == "no_line":
+                    draw.ellipse((107, 47, 113, 53), fill="white")
+                with self.assertRaises(TrackingUnavailable):
+                    current_candle_reference(image, self.colors)
+
+    def test_white_text_or_flat_background_is_not_price_point(self):
+        image = Image.new("RGB", (250, 200), "#999999")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((107, 87, 113, 93), fill="white")
+        with self.assertRaises(TrackingUnavailable):
+            white_price_point(image)
+        image = self.chart([30, 70, 110])
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((107, 87, 113, 93), fill=self.colors[0])
+        draw.rectangle((107, 87, 113, 93), fill="white")
+        with self.assertRaises(TrackingUnavailable):
+            white_price_point(image)
+
+    def test_bright_core_with_glow_and_two_color_dashed_price_line(self):
+        image = self.chart([30, 70, 110], "PUT")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 87, 249, 93), fill="#101827")
+        for left in range(0, 108, 9):
+            draw.line((left, 90, left + 6, 90), fill="#EEF7FF")
+        draw.line((114, 90, 249, 90), fill="#617299")
+        draw.line((102, 90, 114, 90), fill=(215, 224, 243))
+        draw.rectangle((108, 88, 111, 91), fill=(229, 238, 255))
+        draw.point((108, 88), fill=(215, 224, 243))
+        draw.point((111, 91), fill=(215, 224, 243))
+        self.assertEqual(white_price_point(image), 109.5)
+        band = current_candle_reference(image, self.colors)
+        self.assertEqual(detect(image, self.templates, band).signal, "PUT")
+
+    def test_point_resolves_grid_ambiguity_without_accepting_history(self):
+        image = Image.new("RGB", (906, 496), "#101827")
+        draw = ImageDraw.Draw(image)
+        for left, right in (
+            (0, 9), (24, 55), (69, 100), (115, 146), (161, 192),
+            (206, 237), (252, 283), (297, 329), (343, 374),
+            (389, 420), (434, 466), (480, 515),
+            (810, 815), (818, 823), (826, 831),
+        ):
+            draw.rectangle((left, 120, right, 160), fill=self.colors[1])
+        draw.line((0, 160, 905, 160), fill="#F0B414")
+        draw.ellipse((493, 157, 499, 163), fill="white")
+        band = current_candle_reference(image, self.colors)
+        self.assertEqual(band, (493, 499))
+        image.paste(arrow_image("PUT").crop((10, 10, 27, 27)), (442, 65))
+        self.assertIsNone(detect(image, self.templates, band))
+
+    def test_gray_current_candle_does_not_select_previous_put(self):
+        image = self.chart([30, 70, 110, 150])
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((144, 70, 156, 110), fill="#777777")
+        draw.line((0, 90, 249, 90), fill="#F0B414")
+        draw.ellipse((147, 87, 153, 93), fill="white")
+        image.paste(arrow_image("PUT").crop((10, 10, 27, 27)), (102, 135))
+        with self.assertRaises(TrackingUnavailable):
+            current_candle_reference(image, self.colors)
+
+    def test_point_shift_disarms_before_old_candidate_can_submit(self):
+        app = self.ready_app()
+        app.last_reference_center = 70
+        self.run_signal_tick(app)
+        app.execution.submit.assert_not_called()
+        self.assertFalse(app.gate.armed)
+        self.assertEqual(app.gate.consecutive, 0)
+
+    def test_missing_point_never_submits_even_when_gate_ready(self):
+        app = self.ready_app()
+        image = self.chart([30, 70, 110], "CALL")
+        ImageDraw.Draw(image).rectangle((107, 87, 113, 93), fill=self.colors[0])
+        with (
+            patch("bot.ImageGrab.grab", return_value=image),
+            patch("bot.list_monitors", return_value=app.monitors),
+            patch("bot.ImageTk.PhotoImage"),
+            patch("bot.write_event") as write,
+        ):
+            app.tick()
+        app.execution.submit.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse(app.gate.armed)
+
+    def test_reference_rechecked_before_submission(self):
+        app = self.ready_app()
+        first = self.chart([30, 70, 110], "CALL")
+        second = self.chart([30, 70, 110], "CALL")
+        ImageDraw.Draw(second).rectangle((107, 87, 113, 93), fill=self.colors[0])
+        with (
+            patch("bot.ImageGrab.grab", side_effect=(first, second)),
+            patch("bot.list_monitors", return_value=app.monitors),
+            patch("bot.ImageTk.PhotoImage"),
+            patch("bot.time.time", return_value=1800000002),
+            patch("bot.write_event"),
+        ):
+            app.tick()
+        app.execution.submit.assert_not_called()
+        self.assertFalse(app.gate.armed)
 
     def test_follows_moving_candle_and_excludes_history(self):
         for centers in ([30, 70, 110], [30, 70, 110, 150], [20, 60, 100, 140]):
@@ -335,7 +459,7 @@ class TrackingTests(unittest.TestCase):
             app.tick()
         error.assert_not_called()
         write.assert_not_called()
-        app.root.after.assert_called_once_with(200, app.tick)
+        app.root.after.assert_called_once_with(100, app.tick)
         self.assertFalse(app.gate.armed)
         self.assertEqual(app.gate.consecutive, 0)
         self.assertIn("Esperando", app.status.set.call_args.args[0])

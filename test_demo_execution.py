@@ -209,8 +209,9 @@ class DemoTests(unittest.TestCase):
         self.browser.settings.return_value = Settings(
             self.settings.asset, self.settings.stake, "Tiempo 00:17",
         )
-        def prepare(expected, observed):
+        def prepare(expected, observed, current=None):
             self.assertIsNone(self.ledger.pending())
+            self.assertEqual(current, self.browser.settings.return_value)
             return prepared
         self.browser.prepare_expiry.side_effect = prepare
         self.execution.submit("CALL", time.time(), 300)
@@ -286,6 +287,81 @@ class DemoTests(unittest.TestCase):
         settings.assert_called_once()
         content.click.assert_not_called()
         browser.page.get_by_role.assert_not_called()
+
+    def test_matching_expiry_reuses_configuration_from_submit(self):
+        browser = DemoBrowser()
+        browser.page = Mock()
+        observed = datetime(2026, 10, 4, 0, 16, 30,
+                            tzinfo=timezone(timedelta(hours=-5))).timestamp()
+        content = browser.page.get_by_test_id.return_value.get_by_test_id.return_value
+        content.inner_text.return_value = "00:20"
+        with patch.object(browser, "settings") as read, patch(
+            "demo_execution.time.time", return_value=observed + 0.5,
+        ):
+            self.assertEqual(
+                browser.prepare_expiry(self.settings, observed, current=self.settings),
+                self.settings,
+            )
+        read.assert_not_called()
+        content.click.assert_not_called()
+
+    def test_adjusted_expiry_rereads_configuration_even_when_supplied(self):
+        browser = DemoBrowser()
+        browser.page = Mock()
+        observed = datetime(2026, 10, 4, 0, 16, 30,
+                            tzinfo=timezone(timedelta(hours=-5))).timestamp()
+        content = browser.page.get_by_test_id.return_value.get_by_test_id.return_value
+        content.inner_text.side_effect = ["00:17", "00:20"]
+        dialog = browser.page.get_by_role.return_value.filter.return_value
+        dialog.get_by_text.return_value.count.return_value = 1
+        dialog.get_by_text.return_value.is_visible.return_value = True
+        dialog.count.return_value = 0
+        changed = Settings(self.settings.asset, self.settings.stake + 1, "Tiempo 00:20")
+        with patch.object(browser, "settings", return_value=changed) as read, patch(
+            "demo_execution.time.time", return_value=observed + 0.5,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Cambio de activo o importe"):
+                browser.prepare_expiry(self.settings, observed, current=self.settings)
+        read.assert_called_once()
+
+    def test_reused_configuration_still_rejects_delay_or_closed_candle(self):
+        browser = DemoBrowser()
+        browser.page = Mock()
+        observed = datetime(2026, 10, 4, 0, 16, 30,
+                            tzinfo=timezone(timedelta(hours=-5))).timestamp()
+        browser.page.get_by_test_id.return_value.get_by_test_id.return_value.inner_text.return_value = "00:20"
+        for delay, message in ((6.01, "Senal antigua"), (211, "vela cerro")):
+            with self.subTest(delay=delay), patch(
+                "demo_execution.time.time", return_value=observed + delay,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    browser.prepare_expiry(self.settings, observed, current=self.settings)
+
+    def test_signal_age_six_seconds_boundary_in_submit_and_preparation(self):
+        observed = datetime(2026, 10, 4, 0, 16, 30,
+                            tzinfo=timezone(timedelta(hours=-5))).timestamp()
+        browser = DemoBrowser()
+        browser.page = Mock()
+        browser.page.get_by_test_id.return_value.get_by_test_id.return_value.inner_text.return_value = "00:20"
+        for delay in (3.65, 6.0, 6.01):
+            with self.subTest(delay=delay), patch(
+                "demo_execution.time.time", return_value=observed + delay,
+            ), patch.object(self.ledger, "reserve", return_value=1):
+                self.execution.arm()
+                self.browser.click_once.reset_mock()
+                if delay <= 6:
+                    self.assertEqual(self.execution.submit("PUT", observed, 300), 1)
+                    self.browser.click_once.assert_called_once()
+                    self.assertEqual(
+                        browser.prepare_expiry(self.settings, observed, current=self.settings),
+                        self.settings,
+                    )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "antigua"):
+                        self.execution.submit("PUT", observed, 300)
+                    self.browser.click_once.assert_not_called()
+                    with self.assertRaisesRegex(RuntimeError, "limite 6s"):
+                        browser.prepare_expiry(self.settings, observed, current=self.settings)
 
     def test_blocks_click_at_candle_boundary(self):
         browser = DemoBrowser()
@@ -403,7 +479,7 @@ class DemoTests(unittest.TestCase):
     def test_changed_settings_and_stale_signal_prevent_click(self):
         self.execution.arm()
         with self.assertRaises(RuntimeError):
-            self.execution.submit("CALL", time.time() - 5, 300)
+            self.execution.submit("CALL", time.time() - 7, 300)
         self.browser.settings.return_value = Settings("different", Decimal("1"), "23:00")
         with self.assertRaises(RuntimeError):
             self.execution.submit("CALL", time.time(), 300)

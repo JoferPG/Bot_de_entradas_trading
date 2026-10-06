@@ -8,6 +8,7 @@ Un clic incierto bloquea nuevas ordenes, incluso despues de reiniciar.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -22,6 +23,9 @@ from urllib.parse import urlparse
 from playwright.sync_api import (
     BrowserContext, Error as BrowserError, Page, Playwright, sync_playwright,
 )
+
+LOGGER = logging.getLogger("iq_option_bot")
+MAX_SIGNAL_AGE_SECONDS = 6
 
 Direction = Literal["CALL", "PUT"]
 URL = "https://iqoption.com/pwa/traderoom"
@@ -277,12 +281,15 @@ class DemoBrowser:
                 raise RuntimeError(f"Boton {name} no disponible o ambiguo.")
         return Settings(asset, stake, expiry, period)
 
-    def prepare_expiry(self, expected: Settings, observed_at: float) -> Settings:
+    def prepare_expiry(
+        self, expected: Settings, observed_at: float, current: Settings | None = None,
+    ) -> Settings:
         deadline, target = candle_close(observed_at, expected.period)
         page = self.page
         if page is None:
             raise RuntimeError("Navegador cerrado.")
-        current = self.settings()
+        if current is None:
+            current = self.settings()
         if not current.same_parameters(expected):
             raise RuntimeError("Cambio de activo o importe: desarma y revisa.")
         selector = page.get_by_test_id("expirationSelector")
@@ -311,8 +318,13 @@ class DemoBrowser:
         if selector.get_by_test_id("content").inner_text().strip() != target:
             raise RuntimeError("La web no confirma el vencimiento solicitado.")
         now = time.time()
-        if not 0 <= now - observed_at <= 2 or now >= deadline:
-            raise RuntimeError("Senal caducada durante el ajuste: no se enviara la orden.")
+        if now >= deadline:
+            raise RuntimeError("La vela cerro durante la preparacion: no se enviara la orden.")
+        if not 0 <= now - observed_at <= MAX_SIGNAL_AGE_SECONDS:
+            raise RuntimeError(
+                f"Senal antigua tras preparar vencimiento ({now - observed_at:.2f}s; "
+                f"limite {MAX_SIGNAL_AGE_SECONDS}s): no se enviara la orden."
+            )
         return current
 
     @staticmethod
@@ -461,9 +473,13 @@ class DemoExecution:
     def submit(self, direction: Direction, observed_at: float, period: int) -> int:
         if not self.armed or self.settings is None:
             raise RuntimeError("Ejecucion demo no armada.")
-        if not math.isfinite(observed_at) or not 0 <= time.time() - observed_at <= 2:
+        if not math.isfinite(observed_at) or not 0 <= time.time() - observed_at <= MAX_SIGNAL_AGE_SECONDS:
             raise RuntimeError("Senal demasiado antigua: no se enviara la orden.")
-        current = self.browser.settings()
+        started = time.perf_counter()
+        try:
+            current = self.browser.settings()
+        finally:
+            LOGGER.info("Latencia lectura configuracion: %.3fs", time.perf_counter() - started)
         if not current.same_parameters(self.settings):
             self.armed = False
             changes = []
@@ -479,7 +495,11 @@ class DemoExecution:
         if direction not in ("CALL", "PUT") or period not in (60, 300) or period != self.settings.period:
             raise ValueError("Senal o periodo invalido.")
         try:
-            prepared = self.browser.prepare_expiry(self.settings, observed_at)
+            started = time.perf_counter()
+            try:
+                prepared = self.browser.prepare_expiry(self.settings, observed_at, current=current)
+            finally:
+                LOGGER.info("Latencia preparar vencimiento: %.3fs", time.perf_counter() - started)
         except (BrowserError, OSError, RuntimeError, ValueError):
             self.armed = False
             raise
@@ -487,7 +507,11 @@ class DemoExecution:
         deadline, _ = candle_close(observed_at, period)
         identity = self.ledger.reserve(direction, prepared, self.baseline, key, deadline)
         try:
-            self.browser.click_once(direction, prepared)
+            started = time.perf_counter()
+            try:
+                self.browser.click_once(direction, prepared)
+            finally:
+                LOGGER.info("Latencia validacion final y clic: %.3fs", time.perf_counter() - started)
         except (BrowserError, OSError, RuntimeError, ValueError) as exc:
             self.armed = False
             self.ledger.mark(identity, "UNKNOWN", str(exc))
