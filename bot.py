@@ -63,8 +63,6 @@ COLORS: dict[Signal, tuple[int, int, int]] = {
 COLOR_TOLERANCE = 24
 MIN_SCORE = 0.70
 CAPTURE_INTERVAL_MS = 100
-REFERENCE_GRACE_SECONDS = 1.0
-IQ_OPTION_URL = "https://iqoption.com/traderoom"
 CSV_FIELDS = (
     "observed_at_utc", "asset_declared", "timeframe_seconds",
     "inferred_interval_start_utc", "signal", "visual_score", "mode",
@@ -292,29 +290,6 @@ def current_candle_reference(
             "Esperando: punto blanco no coincide con la ultima vela. Sin entrada."
         )
     return (dot - tolerance, dot + tolerance)
-
-
-def reference_loss_is_transient(
-    image: Image.Image,
-    gate: SignalGate,
-    last_center: float | None,
-    last_valid_at: float | None,
-    timestamp: float,
-    monotonic_now: float,
-) -> bool:
-    if (
-        last_center is None
-        or last_valid_at is None
-        or monotonic_now - last_valid_at > REFERENCE_GRACE_SECONDS
-        or monotonic_now < last_valid_at
-        or gate.bucket != int(timestamp // gate.period)
-    ):
-        return False
-    try:
-        dot = white_price_point(image)
-    except TrackingUnavailable:
-        return False
-    return abs(dot - last_center) <= 3
 
 
 def white_price_point(image: Image.Image) -> float:
@@ -929,7 +904,6 @@ class App:
         self.order_status.set("DEMO ACTIVA: esperando una nueva senal validada")
         self.gate = gate
         self.last_reference_center = None
-        self.last_reference_at = None
         self.visual_reference = LiveCandleReference(colors)
         self.ema_analysis = ema_analysis
         self.ema_result = None
@@ -1037,7 +1011,6 @@ class App:
                 self.gate.candidate = None
                 self.gate.consecutive = 0
             self.last_reference_center = reference_center
-            self.last_reference_at = time.monotonic()
             if detection is None and diagnostics:
                 self.gate.absent = 0
                 self.gate.candidate = None
@@ -1158,7 +1131,6 @@ class App:
                 LOGGER.warning("%s", report)
                 self.last_detection_report = report
             self.last_reference_center = None
-            self.last_reference_at = None
             self.gate.armed = False
             self.gate.absent = 0
             self.gate.candidate = None

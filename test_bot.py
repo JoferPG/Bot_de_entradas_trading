@@ -9,10 +9,10 @@ from monitors import Monitor
 from demo_execution import EntryWindowExpired
 
 from bot import (
-    App, COLORS, CSV_FIELDS, IQ_OPTION_URL, Detection, Selector, SignalGate,
+    App, COLORS, CSV_FIELDS, Detection, Selector, SignalGate,
     TrackingUnavailable,
     LOGGER, configure_diagnostics, current_candle_reference, detect, main, make_preview, parse_color,
-    reference_loss_is_transient, template_from, track_candle,
+    template_from, track_candle,
     white_price_point, write_event,
 )
 
@@ -563,7 +563,6 @@ class TrackingTests(unittest.TestCase):
         app.monitors = [Monitor((0, 0, 250, 200), True)]
         app.monitor_index = 0
         app.last_reference_center = 110
-        app.last_reference_at = 99.5
         captured = self.chart([30, 70, 110])
         ImageDraw.Draw(captured).line((165, 70, 165, 110), fill=self.colors[0])
         with (
@@ -579,25 +578,6 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(app.gate.consecutive, 0)
         self.assertIn("Esperando", app.status.set.call_args.args[0])
         app.execution.submit.assert_not_called()
-
-    def test_transient_tracking_grace_rejects_expired_or_moved_reference(self):
-        gate = SignalGate(300)
-        timestamp = 1800000002.0
-        gate.bucket = int(timestamp // gate.period)
-        image = self.chart([30, 70, 110])
-        self.assertTrue(
-            reference_loss_is_transient(image, gate, 110, 99.5, timestamp, 100.0),
-        )
-        self.assertFalse(
-            reference_loss_is_transient(image, gate, 110, 98.9, timestamp, 100.0),
-        )
-        self.assertFalse(
-            reference_loss_is_transient(image, gate, 110, 99.5, timestamp + 300, 100.0),
-        )
-        moved = self.chart([30, 70, 150])
-        self.assertFalse(
-            reference_loss_is_transient(moved, gate, 110, 99.5, timestamp, 100.0),
-        )
 
     def test_invalid_color(self):
         for color in ("green", "#GG0000", "#123"):
