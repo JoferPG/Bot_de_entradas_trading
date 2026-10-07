@@ -5,3 +5,5 @@ senales_simuladas.csv
 diagnostico_bot.log*
 __pycache__/
 .venv/
+*.debug.png
+*.debug.json

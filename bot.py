@@ -39,7 +39,7 @@ from typing import Callable, Literal
 from PIL import Image, ImageChops, ImageDraw, ImageGrab, ImageTk
 from playwright.sync_api import Error as BrowserError
 
-from demo_execution import DemoBrowser, DemoExecution, Ledger
+from demo_execution import DemoBrowser, DemoExecution, EntryWindowExpired, Ledger
 from monitors import Monitor, enable_physical_coordinates, list_monitors, place_selector
 
 Signal = Literal["CALL", "PUT"]
@@ -52,6 +52,7 @@ COLORS: dict[Signal, tuple[int, int, int]] = {
 COLOR_TOLERANCE = 24
 MIN_SCORE = 0.70
 CAPTURE_INTERVAL_MS = 100
+REFERENCE_GRACE_SECONDS = 1.0
 IQ_OPTION_URL = "https://iqoption.com/traderoom"
 CSV_FIELDS = (
     "observed_at_utc", "asset_declared", "timeframe_seconds",
@@ -91,6 +92,7 @@ class TrackingUnavailable(RuntimeError):
 def components(
     image: Image.Image, signal: Signal,
     color: tuple[int, int, int] | None = None, tolerance: int = COLOR_TOLERANCE,
+    min_pixels: int = 12, min_width: int = 4, min_height: int = 4,
 ) -> list[Shape]:
     """Separar formas conectadas del color configurado, no velas ni EMAs."""
     rgb = image.convert("RGB")
@@ -116,13 +118,13 @@ def components(
                     remaining.remove(neighbor)
                     connected.add(neighbor)
                     pending.append(neighbor)
-        if len(connected) < 12:
+        if len(connected) < min_pixels:
             continue
         left = min(x for x, _ in connected)
         top = min(y for _, y in connected)
         width = max(x for x, _ in connected) - left + 1
         height = max(y for _, y in connected) - top + 1
-        if width >= 4 and height >= 4:
+        if width >= min_width and height >= min_height:
             shapes.append(Shape(
                 width, height,
                 frozenset((x - left, y - top) for x, y in connected),
@@ -281,15 +283,41 @@ def current_candle_reference(
     return (dot - tolerance, dot + tolerance)
 
 
+def reference_loss_is_transient(
+    image: Image.Image,
+    gate: SignalGate,
+    last_center: float | None,
+    last_valid_at: float | None,
+    timestamp: float,
+    monotonic_now: float,
+) -> bool:
+    if (
+        last_center is None
+        or last_valid_at is None
+        or monotonic_now - last_valid_at > REFERENCE_GRACE_SECONDS
+        or monotonic_now < last_valid_at
+        or gate.bucket != int(timestamp // gate.period)
+    ):
+        return False
+    try:
+        dot = white_price_point(image)
+    except TrackingUnavailable:
+        return False
+    return abs(dot - last_center) <= 3
+
+
 def white_price_point(image: Image.Image) -> float:
     rgb = image.convert("RGB")
     candidates: list[float] = []
-    for shape in components(rgb, "CALL", color=(255, 255, 255), tolerance=26):
-        if not (4 <= shape.width <= 12 and 4 <= shape.height <= 12):
+    for shape in components(
+        rgb, "CALL", color=(255, 255, 255), tolerance=26,
+        min_pixels=4, min_width=2, min_height=2,
+    ):
+        if not (2 <= shape.width <= 12 and 2 <= shape.height <= 12):
             continue
         if max(shape.width, shape.height) > min(shape.width, shape.height) * 1.5:
             continue
-        if not 0.45 <= len(shape.pixels) / (shape.width * shape.height) <= 0.95:
+        if not 0.45 <= len(shape.pixels) / (shape.width * shape.height) <= 1.0:
             continue
         x = shape.origin[0] + (shape.width - 1) / 2
         y = shape.origin[1] + (shape.height - 1) / 2
@@ -877,11 +905,13 @@ class App:
         self.order_status.set("DEMO ACTIVA: esperando una nueva senal validada")
         self.gate = gate
         self.last_reference_center = None
+        self.last_reference_at = None
         self.tick()
 
     def tick(self) -> None:
         if self.gate is None or self.region is None:
             return
+        image: Image.Image | None = None
         try:
             if self.monitors[self.monitor_index] not in list_monitors():
                 raise RuntimeError("Monitor desconectado o cambiado. Recalibra antes de reiniciar.")
@@ -913,6 +943,7 @@ class App:
                 self.gate.candidate = None
                 self.gate.consecutive = 0
             self.last_reference_center = reference_center
+            self.last_reference_at = time.monotonic()
             if detection is None and diagnostics:
                 self.gate.absent = 0
                 self.gate.candidate = None
@@ -943,6 +974,7 @@ class App:
                 )
                 if self.execution.armed and pending is None:
                     fresh = ImageGrab.grab(bbox=self.region, all_screens=True)
+                    image = fresh
                     fresh_range = current_candle_reference(fresh, self.candle_colors)
                     fresh_detection = detect(fresh, self.templates, fresh_range)
                     if (
@@ -1007,14 +1039,35 @@ class App:
             if report != getattr(self, "last_detection_report", None):
                 LOGGER.warning("%s", report)
                 self.last_detection_report = report
-            self.last_reference_center = None
+            transient = (
+                image is not None and reference_loss_is_transient(
+                    image, self.gate,
+                    getattr(self, "last_reference_center", None),
+                    getattr(self, "last_reference_at", None),
+                    time.time(), time.monotonic(),
+                )
+            )
+            if not transient:
+                self.last_reference_center = None
+                self.last_reference_at = None
+                self.gate.armed = False
             self.gate.absent = 0
-            self.gate.armed = False
             self.gate.candidate = None
             self.gate.consecutive = 0
-            self.signal_text.set("ESPERANDO VELA / SIN AVISO")
+            self.signal_text.set(
+                "REFERENCIA INESTABLE / VALIDACION REINICIADA\nSIN ENTRADA"
+                if transient else "ESPERANDO VELA / SIN AVISO"
+            )
             self.signal_panel.configure(fg="gray")
-            self.status.set(str(exc))
+            self.status.set(
+                f"Referencia temporal; se conserva el rearme, pero vuelve a 1/3. {exc}"
+                if transient else str(exc)
+            )
+        except EntryWindowExpired as exc:
+            LOGGER.warning("Entrada omitida por tiempo; detector sigue activo: %s", exc)
+            self.summary_text.set(self.statistics_summary())
+            self.order_status.set(f"Sin entrada por tiempo vencido: {exc}")
+            self.status.set("Tiempo de entrada vencido. Esperando una nueva senal.")
         except (OSError, ValueError, RuntimeError, BrowserError, sqlite3.Error) as exc:
             LOGGER.exception("Detector detenido por error; sin reintentar ordenes")
             self.stop()

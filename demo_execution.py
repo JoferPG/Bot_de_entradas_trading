@@ -33,6 +33,10 @@ PORTFOLIO_TIMEOUT_MS = 15000
 COLOMBIA = timezone(timedelta(hours=-5))
 
 
+class EntryWindowExpired(RuntimeError):
+    """La ventana de entrada vencio antes de enviar cualquier clic de orden."""
+
+
 def candle_close(observed_at: float, period: int = 300) -> tuple[float, str]:
     if period not in (60, 300):
         raise ValueError("Solo se permiten velas de 1 o 5 minutos.")
@@ -100,7 +104,23 @@ class Ledger:
         self.db.execute(
             "INSERT OR IGNORE INTO statistics_state(id, reset_at) VALUES(1, 0)"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS expired_entry_attempts "
+            "(id INTEGER PRIMARY KEY, created REAL NOT NULL, "
+            "direction TEXT NOT NULL, observed_at REAL NOT NULL, reason TEXT NOT NULL)"
+        )
         self.db.commit()
+
+    def record_expired_attempt(
+        self, direction: Direction, observed_at: float, reason: str,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO expired_entry_attempts(created,direction,observed_at,reason) "
+                "VALUES(?,?,?,?)",
+                (time.time(), direction, observed_at, reason),
+            )
+        LOGGER.warning("Intento %s cancelado por tiempo vencido: %s", direction, reason)
 
     def pending(self) -> sqlite3.Row | None:
         return self.db.execute(
@@ -206,6 +226,10 @@ class Ledger:
             "SELECT * FROM demo_orders WHERE created >= ? AND status='CLOSED' ORDER BY id",
             (reset_at,),
         ).fetchall()
+        attempts = self.db.execute(
+            "SELECT COUNT(*) FROM expired_entry_attempts WHERE created >= ?",
+            (reset_at,),
+        ).fetchone()[0]
         wins = [
             row for row in rows
             if row["returned"] is not None and Decimal(row["returned"]) > Decimal(row["stake"])
@@ -232,6 +256,7 @@ class Ledger:
             f"Neto invertido: ${invested:.2f}",
             f"Ingresos: ${income:.2f}",
             f"Perdidas: ${losses_amount:.2f}",
+            f"Intentos: {attempts}",
         ))
 
     def close(self) -> None:
@@ -355,12 +380,14 @@ class DemoBrowser:
             raise RuntimeError("La web no confirma el vencimiento solicitado.")
         now = time.time()
         if now >= deadline:
-            raise RuntimeError("La vela cerro durante la preparacion: no se enviara la orden.")
-        if not 0 <= now - observed_at <= MAX_SIGNAL_AGE_SECONDS:
-            raise RuntimeError(
+            raise EntryWindowExpired("La vela cerro durante la preparacion: no se enviara la orden.")
+        if now - observed_at > MAX_SIGNAL_AGE_SECONDS:
+            raise EntryWindowExpired(
                 f"Senal antigua tras preparar vencimiento ({now - observed_at:.2f}s; "
                 f"limite {MAX_SIGNAL_AGE_SECONDS}s): no se enviara la orden."
             )
+        if not 0 <= now - observed_at <= MAX_SIGNAL_AGE_SECONDS:
+            raise RuntimeError("Hora de senal invalida tras preparar vencimiento.")
         return current
 
     @staticmethod
@@ -447,7 +474,10 @@ class DemoBrowser:
             page.bring_to_front()
         return positions
 
-    def click_once(self, direction: Direction, settings: Settings) -> None:
+    def click_once(
+        self, direction: Direction, settings: Settings,
+        observed_at: float | None = None,
+    ) -> None:
         if direction not in ("CALL", "PUT"):
             raise ValueError("Direccion no permitida.")
         if self.settings() != settings:
@@ -460,9 +490,17 @@ class DemoBrowser:
             "content",
         ).inner_text().strip()
         now = time.time()
+        if observed_at is not None:
+            expected_deadline, _ = candle_close(observed_at, settings.period)
+            if now >= expected_deadline:
+                raise EntryWindowExpired("La vela cerro antes del clic: entrada bloqueada.")
+            if now - observed_at > MAX_SIGNAL_AGE_SECONDS:
+                raise EntryWindowExpired("Senal demasiado antigua antes del clic: entrada bloqueada.")
+            if not 0 <= now - observed_at <= MAX_SIGNAL_AGE_SECONDS:
+                raise RuntimeError("Hora de senal invalida antes del clic.")
         deadline, target = candle_close(now, settings.period)
         if deadline - now <= 2:
-            raise RuntimeError("Quedan menos de 2 segundos para el cierre: entrada bloqueada.")
+            raise EntryWindowExpired("Quedan 2 segundos o menos para el cierre: entrada bloqueada.")
         if selected != target:
             raise RuntimeError("La vela cambio o el vencimiento no coincide con su cierre.")
         page.get_by_role(
@@ -509,7 +547,16 @@ class DemoExecution:
     def submit(self, direction: Direction, observed_at: float, period: int) -> int:
         if not self.armed or self.settings is None:
             raise RuntimeError("Ejecucion demo no armada.")
-        if not math.isfinite(observed_at) or not 0 <= time.time() - observed_at <= MAX_SIGNAL_AGE_SECONDS:
+        if direction not in ("CALL", "PUT") or period not in (60, 300) or period != self.settings.period:
+            raise ValueError("Senal o periodo invalido.")
+        age = time.time() - observed_at
+        if not math.isfinite(observed_at) or age < 0:
+            raise RuntimeError("Hora de senal invalida: no se enviara la orden.")
+        if age > MAX_SIGNAL_AGE_SECONDS:
+            reason = "Senal demasiado antigua: no se enviara la orden."
+            self.ledger.record_expired_attempt(direction, observed_at, reason)
+            raise EntryWindowExpired(reason)
+        if not 0 <= age <= MAX_SIGNAL_AGE_SECONDS:
             raise RuntimeError("Senal demasiado antigua: no se enviara la orden.")
         started = time.perf_counter()
         try:
@@ -528,14 +575,15 @@ class DemoExecution:
             raise RuntimeError(
                 "Configuracion modificada: ejecucion desarmada. " + "; ".join(changes)
             )
-        if direction not in ("CALL", "PUT") or period not in (60, 300) or period != self.settings.period:
-            raise ValueError("Senal o periodo invalido.")
         try:
             started = time.perf_counter()
             try:
                 prepared = self.browser.prepare_expiry(self.settings, observed_at, current=current)
             finally:
                 LOGGER.info("Latencia preparar vencimiento: %.3fs", time.perf_counter() - started)
+        except EntryWindowExpired as exc:
+            self.ledger.record_expired_attempt(direction, observed_at, str(exc))
+            raise
         except (BrowserError, OSError, RuntimeError, ValueError):
             self.armed = False
             raise
@@ -545,9 +593,13 @@ class DemoExecution:
         try:
             started = time.perf_counter()
             try:
-                self.browser.click_once(direction, prepared)
+                self.browser.click_once(direction, prepared, observed_at=observed_at)
             finally:
                 LOGGER.info("Latencia validacion final y clic: %.3fs", time.perf_counter() - started)
+        except EntryWindowExpired as exc:
+            self.ledger.mark(identity, "CANCELLED", str(exc))
+            self.ledger.record_expired_attempt(direction, observed_at, str(exc))
+            raise
         except (BrowserError, OSError, RuntimeError, ValueError) as exc:
             self.armed = False
             self.ledger.mark(identity, "UNKNOWN", str(exc))

@@ -11,6 +11,112 @@ python bot.py
 
 Si Python no esta en PATH, usa la ruta completa de tu interprete.
 
+## Detectores experimentales offline (sin integracion con el bot)
+
+[candle_tracker.py](candle_tracker.py) usa OpenCV/HSV para probar por separado
+la linea roja vertical de expiracion, la ultima vela de una serie regular
+y un punto blanco compacto cerca de ella. No importa `bot.py`, no abre el
+navegador y no envia operaciones. La logica principal no utiliza este modulo.
+Las dependencias opcionales estan en [requirements_tracker.txt](requirements_tracker.txt).
+
+```powershell
+Set-Location 'D:\07 - Script'
+python -m pip install -r requirements_tracker.txt
+python test_candle_tracker.py --image 'C:\capturas\grafico.png'
+python test_expiration_line.py --image 'C:\capturas\grafico.png'
+python test_candle_detector.py --image 'C:\capturas\grafico.png'
+python test_white_point.py --image 'C:\capturas\grafico.png'
+```
+
+Cada comando genera `<nombre>.<componente>.debug.png` y un JSON con coordenadas,
+confianzas, estados y motivos de deteccion incompleta. `--output` cambia la
+ruta del PNG. No se sobrescriben las capturas fuente. Los bounding boxes son
+`[x1,y1,x2,y2]`, con borde derecho/inferior exclusivo, en pixeles de la imagen
+original. La imagen de debug conserva el grafico a su resolucion y agrega
+un panel inferior: magenta=expiracion, cian=bounding box, amarillo=cuerpo,
+azul=mecha superior, naranja=mecha inferior y circulo blanco=punto.
+Una mecha no visible se informa como `null`, no se inventa.
+Codigo de salida: 0=deteccion solicitada encontrada, 2=incompleta con debug
+disponible, 1=error de entrada/archivo. Los comandos por componente comparten
+la extraccion de contexto espacial, pero verifican su objeto correspondiente.
+
+La ROI por defecto excluye el 1% izquierdo, 3% derecho, 14% superior y 8%
+inferior del perfil de grafico mostrado en la captura de referencia. No
+son coordenadas del punto ni de la vela. Para capturas con navegador/paneles
+distintos es necesario indicar el area valida: `--roi 'x1,y1,x2,y2'`.
+No hay reconocimiento universal de botones, textos ni disenos de plataforma.
+
+`WhitePointTracker` guarda x, y, radio, confidence y timestamp. Combina brillo,
+baja saturacion, tamano, circularidad, compacidad, proximidad a la vela y
+soporte horizontal de precio (puede estar visible solo a un lado).
+El punto no tiene que estar exactamente en el centro del cuerpo.
+Tras adquirirlo, busca localmente en +/-24 px X y +/-40 px Y; si falla
+amplia tres veces esos radios, siempre dentro de la ROI y cerca de la vela.
+Si falta o es ambiguo, devuelve `null`, marca `LOW_CONFIDENCE` y solicita
+recalibracion. En el siguiente frame vuelve a adquirirlo cerca de una vela
+detectada; no devuelve la coordenada vieja como deteccion actual.
+Cambiar ROI/resolucion o superar un segundo sin punto reinicia la continuidad.
+Los timestamps deben aumentar; de otro modo se informa un error.
+
+Para comparar capturas consecutivas:
+
+```powershell
+python test_candle_tracker.py --image 'C:\capturas\frame1.png' `
+  --next-image 'C:\capturas\frame2.png' --next-image 'C:\capturas\frame3.png' `
+  --frame-interval 0.2 --output 'C:\capturas\secuencia.debug.png'
+```
+
+El JSON incluye todos los frames y el PNG muestra el ultimo. El intervalo
+debe coincidir con el tiempo real entre capturas; de ello depende velocity_y
+(px/s). Delta Y negativo=UP, positivo=DOWN, dentro de +/-1 px=STABLE.
+La primera captura y las readquisiciones no tienen movimiento medido.
+Estos datos no generan senales de trading.
+
+La confianza global pondera vela 40%, punto 35%, expiracion 25% y agrega
+3 puntos porcentuales si coinciden espacialmente. Objetos ausentes aportan
+cero y sin coincidencia completa el score no supera 69%. Las detecciones
+parciales se conservan para debug; no autorizan entradas.
+Los scores son heuristicas de calidad visual, **no probabilidades calibradas**
+ni garantia de identificar la vela en tiempo real. La linea se identifica
+por color/forma, sin leer su etiqueta; otros disenos requieren validacion.
+Las superposiciones de precio se cierran morfologicamente para reconstruir
+continuidad del cuerpo/mecha; sus limites visibles pueden variar unos pixeles.
+
+Pruebas sinteticas independientes:
+
+```powershell
+python -m unittest test_expiration_line test_candle_detector test_white_point test_candle_tracker
+```
+
+La regresion de la captura compartida de 1526x768 se activa definiendo
+`IQ_OPTION_REFERENCE_IMAGE` con su ruta antes de ejecutar ese comando.
+Comprueba linea, cuerpo, bounding box, ambas mechas, color, punto y scores
+a escalas 0.75, 1 y 1.5. Esa variable debe apuntar a **esa misma referencia**,
+no a otra captura. Una imagen real no verifica tracking temporal; las pruebas
+de desplazamiento, perdida y readquisicion usan secuencias sinteticas.
+
+### Dos posiciones de la vela respecto a la linea roja
+
+El detector experimental contempla tanto el cuerpo a la izquierda de la
+linea roja como el cuerpo atravesado por esa linea (captura de apertura).
+En el segundo caso, el punto puede estar a la derecha de la linea sin ser
+rechazado: debe seguir cerca del centro y del rango vertical de la vela.
+No se infiere la apertura ni el tiempo transcurrido solo por esta posicion.
+Se conserva la comprobacion de forma y espaciado de la serie; no se acepta
+arbitrariamente cualquier cuerpo situado a la derecha de la linea.
+
+Para separar una vela roja de la linea roja que la atraviesa, se elimina
+una franja estrecha alrededor de la linea detectada antes de segmentar los
+cuerpos y se reconstruye ese hueco horizontal. Asi la linea no se mide como
+una mecha larga. Los extremos ocultos por la linea o el punto pueden ser
+inciertos; las mechas no visibles siguen siendo `null`.
+La imagen de debug indica `LEFT OF RED LINE` o `CROSSES RED LINE`.
+La regresion de la segunda captura compartida (1063x768) se activa con
+`IQ_OPTION_OPENING_IMAGE`. Puede ejecutarse junto con la primera referencia
+para verificar ambas a escalas 0.75, 1 y 1.5. Esta captura ya esta recortada
+al grafico: opcionalmente usa `--roi '0,0,1063,750'` para incluir la parte
+superior sin el icono inferior.
+
 ## Uso
 
 1. El bot abre una ventana dedicada de Microsoft Edge con su perfil local
@@ -73,7 +179,7 @@ seguimiento normal (intervalo de 100 ms mas el tiempo de procesamiento),
 sin parpadeo. El marco blanco sigue la vela actual identificada.
 Las lineas se dibujan despues de reducir la vista para conservar su grosor.
 Blanco indica una franja estrecha centrada en el punto blanco de precio.
-Primero se busca un unico nucleo blanco compacto de 4 a 12 pixeles por eje
+Primero se busca un unico nucleo blanco compacto de 2 a 12 pixeles por eje
 (RGB de 229 a 255 por canal). Se excluye el brillo tenue que puede unirlo
 a un segmento discontinuo. La linea horizontal debe tener soporte y
 contraste con el fondo a ambos lados; puede cambiar de color entre lados.
@@ -97,6 +203,11 @@ como maximo una senal por intervalo. Las flechas presentes al iniciar y
 las centradas fuera de la referencia no habilitan entradas. Un desplazamiento
 del punto mayor de 3 pixeles reinicia el rearme; antes de solicitar la orden
 se toma otra captura y se exige el mismo punto y direccion de flecha.
+Un fallo aislado de seguimiento de hasta 1 segundo conserva el rearme solo
+si el punto blanco reaparece en la misma posicion y dentro del mismo
+intervalo. Aun asi borra el candidato y vuelve a exigir tres reconocimientos
+consecutivos. Si falta el punto, se mueve, cambia el intervalo o se supera
+ese segundo, se desarma como antes y se requiere rearmado.
 La comprobacion es visual, no prueba la hora de la vela ni garantiza ausencia
 de falsos positivos. Los limites de tamano se deben verificar con el zoom
 real; no se relajan automaticamente tras errores. Se conservan las comprobaciones
@@ -124,6 +235,16 @@ El panel presenta solo las estadisticas generales desde el ultimo reinicio:
   campo **Rendimiento** de los detalles observados.
 - Perdidas: monto no recuperado en las operaciones con devolucion menor que
   su inversion.
+- Intentos: entradas canceladas exclusivamente por tiempo vencido (senal
+  mayor de 6 segundos, vela cerrada o 2 segundos o menos para su cierre).
+  No incluye operaciones enviadas ni otros bloqueos. Se guarda en el registro
+  local y se pone a cero con **REINICIAR ESTADISTICAS**, sin borrar su historial.
+
+Si vence el tiempo antes del clic de orden, esa entrada se omite y el bot
+permanece activo y armado, esperando una nueva senal validada. No reintenta
+la senal vencida en el mismo intervalo. No cuenta como perdida ni inversion.
+Los errores de cuenta, configuracion, navegador y clic incierto mantienen
+sus bloqueos de seguridad y no se convierten en intentos por tiempo.
 
 El boton **REINICIAR ESTADISTICAS** confirma antes de poner el corte
 estadistico en la hora actual. No borra operaciones de `operaciones_demo.sqlite3`

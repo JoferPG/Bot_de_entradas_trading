@@ -5,10 +5,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from demo_execution import (
-    PORTFOLIO_TIMEOUT_MS, DemoBrowser, DemoExecution, Ledger, Position, Settings,
+    PORTFOLIO_TIMEOUT_MS, DemoBrowser, DemoExecution, EntryWindowExpired, Ledger, Position, Settings,
     candle_close, money,
 )
 from playwright.sync_api import TimeoutError as BrowserTimeoutError
@@ -101,7 +101,7 @@ class DemoTests(unittest.TestCase):
             self.execution.submit("PUT", now, 60)
             self.execution.refresh()
         self.browser.positions.assert_not_called()
-        self.browser.click_once.assert_called_once_with("PUT", settings)
+        self.browser.click_once.assert_called_once_with("PUT", settings, observed_at=now)
         self.assertEqual(self.ledger.pending()["deadline"], now + 40)
         self.browser.positions.return_value = [self.position("minute", True, Decimal(0), "PUT")]
         self.refresh_after_expiry()
@@ -215,7 +215,7 @@ class DemoTests(unittest.TestCase):
             return prepared
         self.browser.prepare_expiry.side_effect = prepare
         self.execution.submit("CALL", time.time(), 300)
-        self.browser.click_once.assert_called_once_with("CALL", prepared)
+        self.browser.click_once.assert_called_once_with("CALL", prepared, observed_at=ANY)
         self.assertEqual(self.ledger.pending()["expiry"], prepared.expiry)
 
     def test_unavailable_expiry_blocks_without_reserving_or_clicking(self):
@@ -445,7 +445,7 @@ class DemoTests(unittest.TestCase):
     def test_one_click_then_blocked_until_confirmed_closure(self):
         self.execution.arm()
         self.execution.submit("CALL", time.time(), 300)
-        self.browser.click_once.assert_called_once_with("CALL", self.settings)
+        self.browser.click_once.assert_called_once_with("CALL", self.settings, observed_at=ANY)
         with self.assertRaises(RuntimeError):
             self.execution.submit("PUT", time.time(), 300)
         self.browser.positions.return_value = [self.position()]
@@ -487,6 +487,87 @@ class DemoTests(unittest.TestCase):
         self.browser.settings.return_value = Settings("different", Decimal("1"), "23:00")
         with self.assertRaises(RuntimeError):
             self.execution.submit("CALL", time.time(), 300)
+        self.browser.click_once.assert_not_called()
+
+    def test_expired_signal_counts_once_and_allows_a_later_entry(self):
+        observed = 1_800_000_002.0
+        self.execution.arm()
+        with patch("demo_execution.time.time", return_value=observed + 6.01):
+            with self.assertRaises(EntryWindowExpired):
+                self.execution.submit("CALL", observed, 300)
+        self.assertTrue(self.execution.armed)
+        self.assertIsNone(self.ledger.pending())
+        self.browser.click_once.assert_not_called()
+        self.assertIn("Intentos: 1", self.ledger.summary())
+        self.assertEqual(self.execution.session_losses, 0)
+        with patch("demo_execution.time.time", return_value=observed + 300):
+            self.execution.submit("PUT", observed + 300, 300)
+        self.browser.click_once.assert_called_once()
+        self.assertIn("Intentos: 1", self.ledger.summary())
+
+    def test_expiry_during_preparation_or_before_click_keeps_execution_armed(self):
+        observed = 1_800_000_002.0
+        self.execution.arm()
+        for stage in ("prepare_expiry", "click_once"):
+            with self.subTest(stage=stage):
+                self.browser.prepare_expiry.side_effect = None
+                self.browser.click_once.side_effect = None
+                getattr(self.browser, stage).side_effect = EntryWindowExpired("Tiempo vencido")
+                with patch("demo_execution.time.time", return_value=observed):
+                    with self.assertRaises(EntryWindowExpired):
+                        self.execution.submit("CALL", observed, 300)
+                self.assertTrue(self.execution.armed)
+                self.assertIsNone(self.ledger.pending())
+        self.assertIn("Intentos: 2", self.ledger.summary())
+        row = self.ledger.db.execute("SELECT status FROM demo_orders").fetchone()
+        self.assertEqual(row["status"], "CANCELLED")
+        self.assertEqual(self.execution.session_losses, 0)
+        self.browser.click_once.side_effect = None
+        with patch("demo_execution.time.time", return_value=observed + 300):
+            self.execution.submit("PUT", observed + 300, 300)
+        self.assertEqual(self.ledger.pending()["status"], "REQUESTED")
+
+    def test_final_time_checks_never_press_order_button(self):
+        browser = DemoBrowser()
+        browser.page = Mock()
+        observed = 1_800_000_002.0
+        for now, source_time in (
+            (observed + 6.01, observed),
+            (1_800_000_300.0, 1_800_000_299.0),
+            (1_800_000_298.0, 1_800_000_297.0),
+        ):
+            with self.subTest(now=now), patch.object(
+                browser, "settings", return_value=self.settings,
+            ), patch.object(browser, "require_demo"), patch(
+                "demo_execution.time.time", return_value=now,
+            ):
+                with self.assertRaises(EntryWindowExpired):
+                    browser.click_once("CALL", self.settings, observed_at=source_time)
+        browser.page.get_by_role.assert_not_called()
+
+    def test_attempt_count_persists_and_reset_preserves_attempt_history(self):
+        with patch("demo_execution.time.time", return_value=1_800_000_000):
+            self.ledger.record_expired_attempt("CALL", 1_799_999_993, "Senal antigua")
+        self.ledger.close()
+        self.ledger = Ledger(self.path)
+        self.assertIn("Intentos: 1", self.ledger.summary())
+        self.ledger.reset_statistics(1_800_000_010)
+        self.assertIn("Intentos: 0", self.ledger.summary())
+        self.assertEqual(
+            self.ledger.db.execute("SELECT COUNT(*) FROM expired_entry_attempts").fetchone()[0], 1,
+        )
+        with patch("demo_execution.time.time", return_value=1_800_000_020):
+            self.ledger.record_expired_attempt("PUT", 1_800_000_013, "Senal antigua")
+        self.assertIn("Intentos: 1", self.ledger.summary())
+
+    def test_invalid_signal_time_is_not_a_recoverable_expiry(self):
+        self.execution.arm()
+        for observed in (float("nan"), float("inf"), float("-inf"), time.time() + 100):
+            with self.subTest(observed=observed):
+                with self.assertRaises(RuntimeError) as error:
+                    self.execution.submit("CALL", observed, 300)
+                self.assertNotIsInstance(error.exception, EntryWindowExpired)
+        self.assertIn("Intentos: 0", self.ledger.summary())
         self.browser.click_once.assert_not_called()
 
     def test_history_is_not_counted_and_ambiguous_new_positions_block(self):

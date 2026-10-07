@@ -6,12 +6,14 @@ from unittest.mock import Mock, patch
 
 from PIL import Image, ImageDraw, ImageFont
 from monitors import Monitor
+from demo_execution import EntryWindowExpired
 
 from bot import (
     App, COLORS, CSV_FIELDS, IQ_OPTION_URL, Detection, Selector, SignalGate,
     TrackingUnavailable,
     LOGGER, configure_diagnostics, current_candle_reference, detect, main, make_preview, parse_color,
-    template_from, track_candle, white_price_point, write_event,
+    reference_loss_is_transient, template_from, track_candle,
+    white_price_point, write_event,
 )
 
 
@@ -263,10 +265,8 @@ class TrackingTests(unittest.TestCase):
         draw.ellipse((107, 87, 113, 93), fill="white")
         with self.assertRaises(TrackingUnavailable):
             white_price_point(image)
-        image = self.chart([30, 70, 110])
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((107, 87, 113, 93), fill=self.colors[0])
-        draw.rectangle((107, 87, 113, 93), fill="white")
+        image = Image.new("RGB", (250, 200), "#101827")
+        ImageDraw.Draw(image).rectangle((107, 87, 113, 93), fill="white")
         with self.assertRaises(TrackingUnavailable):
             white_price_point(image)
 
@@ -284,6 +284,30 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(white_price_point(image), 109.5)
         band = current_candle_reference(image, self.colors)
         self.assertEqual(detect(image, self.templates, band).signal, "PUT")
+
+    def test_small_two_by_two_price_point_is_detected(self):
+        image = self.chart([30, 70, 110])
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((106, 86, 114, 94), fill="#101827")
+        draw.line((0, 90, 105, 90), fill="#EEF7FF")
+        draw.line((114, 90, 249, 90), fill="#617299")
+        draw.rectangle((109, 89, 110, 90), fill=(240, 248, 255))
+        self.assertEqual(white_price_point(image), 109.5)
+        self.assertEqual(
+            current_candle_reference(image, self.colors),
+            (106.5, 112.5),
+        )
+
+    def test_single_bright_pixel_or_thin_line_is_not_a_price_point(self):
+        image = self.chart([30, 70, 110])
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((106, 86, 114, 94), fill="#101827")
+        draw.point((109, 90), fill="white")
+        with self.assertRaises(TrackingUnavailable):
+            white_price_point(image)
+        draw.rectangle((109, 89, 110, 89), fill="white")
+        with self.assertRaises(TrackingUnavailable):
+            white_price_point(image)
 
     def test_point_resolves_grid_ambiguity_without_accepting_history(self):
         image = Image.new("RGB", (906, 496), "#101827")
@@ -495,6 +519,62 @@ class TrackingTests(unittest.TestCase):
         app.preview_panel.configure.assert_called_once_with(image=photo.return_value)
         app.execution.submit.assert_not_called()
 
+    def test_brief_tracking_loss_keeps_armed_but_restarts_three_frame_count(self):
+        app = App.__new__(App)
+        app.gate = SignalGate(300)
+        timestamp = 1800000002.0
+        app.gate.bucket = int(timestamp // app.gate.period)
+        app.gate.armed = True
+        app.gate.candidate = "PUT"
+        app.gate.consecutive = 2
+        app.region = (0, 0, 250, 200)
+        app.candle_colors = self.colors
+        app.signal_text = Mock()
+        app.signal_panel = Mock()
+        app.preview_panel = Mock()
+        app.status = Mock()
+        app.root = Mock()
+        app.execution = Mock()
+        app.order_status = Mock()
+        app.monitors = [Monitor((0, 0, 250, 200), True)]
+        app.monitor_index = 0
+        app.last_reference_center = 110
+        app.last_reference_at = 99.5
+        captured = self.chart([30, 70, 110])
+        ImageDraw.Draw(captured).line((165, 70, 165, 110), fill=self.colors[0])
+        with (
+            patch("bot.ImageGrab.grab", return_value=captured),
+            patch("bot.ImageTk.PhotoImage"),
+            patch("bot.time.time", return_value=timestamp),
+            patch("bot.time.monotonic", return_value=100.0),
+            patch("bot.list_monitors", return_value=app.monitors),
+        ):
+            app.tick()
+        self.assertTrue(app.gate.armed)
+        self.assertIsNone(app.gate.candidate)
+        self.assertEqual(app.gate.consecutive, 0)
+        self.assertIn("se conserva el rearme", app.status.set.call_args.args[0])
+        app.execution.submit.assert_not_called()
+
+    def test_transient_tracking_grace_rejects_expired_or_moved_reference(self):
+        gate = SignalGate(300)
+        timestamp = 1800000002.0
+        gate.bucket = int(timestamp // gate.period)
+        image = self.chart([30, 70, 110])
+        self.assertTrue(
+            reference_loss_is_transient(image, gate, 110, 99.5, timestamp, 100.0),
+        )
+        self.assertFalse(
+            reference_loss_is_transient(image, gate, 110, 98.9, timestamp, 100.0),
+        )
+        self.assertFalse(
+            reference_loss_is_transient(image, gate, 110, 99.5, timestamp + 300, 100.0),
+        )
+        moved = self.chart([30, 70, 150])
+        self.assertFalse(
+            reference_loss_is_transient(moved, gate, 110, 99.5, timestamp, 100.0),
+        )
+
     def test_invalid_color(self):
         for color in ("green", "#GG0000", "#123"):
             with self.assertRaises(ValueError):
@@ -615,6 +695,43 @@ class TrackingTests(unittest.TestCase):
         self.assertIsNone(app.gate)
         self.assertIn("Vencimiento no disponible", app.order_status.set.call_args.args[0])
         self.assertTrue(any("Vencimiento no disponible" in entry for entry in logs.output))
+
+    def test_expired_entry_updates_attempts_without_stopping_or_retrying_same_signal(self):
+        app = self.ready_app()
+        app.execution.armed = True
+        app.execution.session_losses = 1
+        app.execution.submit.side_effect = EntryWindowExpired("Senal demasiado antigua")
+        app.ledger.summary.return_value = "Intentos: 1"
+        app.summary_text = Mock()
+        gate = app.gate
+        with self.assertLogs(LOGGER, level="WARNING"), patch("bot.messagebox.showerror") as error:
+            self.run_signal_tick(app)
+            self.run_signal_tick(app)
+        self.assertIs(app.gate, gate)
+        self.assertTrue(app.execution.armed)
+        self.assertTrue(gate.emitted)
+        app.execution.submit.assert_called_once()
+        app.summary_text.set.assert_called_once_with("Intentos: 1\nPerdidas de seguridad: 1/3")
+        self.assertIn("tiempo vencido", app.order_status.set.call_args.args[0])
+        self.assertEqual(app.root.after.call_count, 2)
+        error.assert_not_called()
+        app.execution.submit.side_effect = None
+        app.schedule_results = Mock()
+        with (
+            patch("bot.ImageGrab.grab") as grab,
+            patch("bot.list_monitors", return_value=app.monitors),
+            patch("bot.ImageTk.PhotoImage"),
+            patch("bot.time.time") as clock,
+            patch("bot.write_event"),
+        ):
+            for index, direction in enumerate((None, None, "PUT", "PUT", "PUT")):
+                grab.return_value = self.chart([30, 70, 110], direction)
+                clock.return_value = 1_800_000_301 + index * 0.2
+                app.tick()
+        self.assertEqual(app.execution.submit.call_count, 2)
+        self.assertEqual(app.execution.submit.call_args.args[0], "PUT")
+        app.schedule_results.assert_called_once()
+        self.assertTrue(app.execution.armed)
 
     def test_rejected_colored_shape_does_not_rearm_as_absence(self):
         app = self.ready_app()
