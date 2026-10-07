@@ -134,12 +134,26 @@ class ExpirationLineDetector:
 
 
 class CandleDetector:
+    def __init__(
+        self, colors: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
+    ) -> None:
+        self.colors = colors
+
     def detect(
         self, image: Image, roi: Box, expiration: ExpirationLine | None,
     ) -> Candle | None:
         x1, y1, x2, y2 = roi
         crop = image[y1:y2, x1:x2]
         masks = color_masks(crop)
+        if self.colors is not None:
+            masks = tuple(
+                cv2.inRange(
+                    crop,
+                    np.array([max(0, channel-24) for channel in rgb[::-1]], dtype=np.uint8),
+                    np.array([min(255, channel+24) for channel in rgb[::-1]], dtype=np.uint8),
+                )
+                for rgb in self.colors
+            )
         candidates: list[Candle] = []
         for color, mask in zip(("GREEN", "RED"), masks):
             gap = max(3, round(image.shape[0] / 768 * 9)) | 1
@@ -372,9 +386,11 @@ class WhitePointTracker:
 
 
 class CandleTracker:
-    def __init__(self) -> None:
+    def __init__(
+        self, colors: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
+    ) -> None:
         self.expiration_detector = ExpirationLineDetector()
-        self.candle_detector = CandleDetector()
+        self.candle_detector = CandleDetector(colors)
         self.white_point_tracker = WhitePointTracker()
 
     def update(
@@ -413,7 +429,7 @@ class CandleTracker:
         )
 
 
-def draw_debug(image: Image, result: TrackingResult) -> Image:
+def draw_debug(image: Image, result: TrackingResult, include_panel: bool = True) -> Image:
     output = image.copy()
     cv2.rectangle(output, result.roi[:2], result.roi[2:], (110, 110, 110), 1)
     if result.expiration:
@@ -430,6 +446,8 @@ def draw_debug(image: Image, result: TrackingResult) -> Image:
         center = (round(point.x), round(point.y))
         cv2.circle(output, center, math.ceil(point.radius)+4, (255, 255, 255), 1)
         cv2.drawMarker(output, center, (255, 0, 255), cv2.MARKER_CROSS, 8, 1)
+    if not include_panel:
+        return output
     lines = [
         f"GLOBAL {result.global_confidence:.1%} | spatial agreement: {result.spatial_agreement}",
         f"POINT STATE {result.point_state} search={result.point_search_stage} recalibrate={result.recalibration_required}",

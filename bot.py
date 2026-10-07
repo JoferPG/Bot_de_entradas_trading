@@ -8,8 +8,8 @@ El inicio de sesion y la seleccion de cuenta demo son manuales.
 Calibrar dos flechas historicas como muestras, confirmar sus vistas previas
 y seleccionar el area del grafico. Se filtran botones anchos y elementos
 aislados buscando una secuencia de al menos tres velas con espaciado regular.
-Se exige un punto blanco sobre una linea de precio alineado con la vela
-mas reciente; no se usa una vela historica si falta esta referencia.
+OpenCV exige linea roja de expiracion, vela actual y punto blanco con
+coincidencia espacial; admite una vela a la izquierda o cruzando la linea.
 El grafico debe estar en tiempo real; no se puede verificar esto por imagen.
 Los colores de velas son configurables y distintos de los de las flechas.
 Mantener el grafico visible y sin cambiar activo, periodo, zoom o posicion.
@@ -36,11 +36,13 @@ from tkinter import messagebox
 from tkinter import ttk
 from typing import Callable, Literal
 
+import cv2
 from PIL import Image, ImageChops, ImageDraw, ImageGrab, ImageTk
 from playwright.sync_api import Error as BrowserError
 
 from demo_execution import DemoBrowser, DemoExecution, EntryWindowExpired, Ledger
 from monitors import Monitor, enable_physical_coordinates, list_monitors, place_selector
+from live_candle_reference import LiveCandleReference, ReferenceUnavailable
 
 Signal = Literal["CALL", "PUT"]
 Box = tuple[int, int, int, int]
@@ -595,6 +597,8 @@ class App:
         self.green_candle = tk.StringVar(value="#2D9E6B")
         self.red_candle = tk.StringVar(value="#E44A4E")
         self.candle_colors = (parse_color("#2D9E6B"), parse_color("#E44A4E"))
+        self.visual_reference: LiveCandleReference | None = None
+        self.reference_status = tk.StringVar(value="Referencia: pendiente")
         self.signal_text = tk.StringVar(value="SIN SENAL ACTUAL")
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.browser = DemoBrowser()
@@ -684,6 +688,7 @@ class App:
         self.signal_panel.pack(pady=5)
         self.preview_panel = tk.Label(content)
         self.preview_panel.pack(pady=3)
+        tk.Label(content, textvariable=self.reference_status, wraplength=430, justify="left").pack(pady=3)
         tk.Label(content, textvariable=self.status, wraplength=430).pack(padx=12, pady=8)
         tk.Label(content, text=f"Registro local: {self.log_path}", wraplength=430).pack(pady=5)
         root.bind("<Escape>", lambda _event: self.stop())
@@ -834,14 +839,14 @@ class App:
                 f"| izquierda={self.region[0]}, arriba={self.region[1]}"
             )
             self.status.set(
-                f"Zona {box}. Incluye las velas y espacio de flechas; "
-                "puede incluir botones. Selecciona un solo grafico visible."
+                f"Zona {box}. Incluye al menos tres velas, flechas, punto blanco "
+                "y linea roja. Excluye botones y paneles."
             )
 
         try:
             Selector(
                 self.root, image,
-                "Selecciona un grafico completo; puede incluir botones",
+                "Selecciona solo el grafico con linea roja, velas y punto",
                 selected, monitor=monitor,
             )
         except (OSError, RuntimeError) as exc:
@@ -876,7 +881,7 @@ class App:
             return
         if not messagebox.askokcancel(
             "Iniciar detector y operaciones SOLO DEMO",
-            "La zona puede incluir botones; necesita al menos tres velas visibles "
+            "La zona debe excluir botones e incluir la linea roja, el punto blanco y al menos tres velas visibles "
             "de un solo grafico. El grafico debe estar EN TIEMPO REAL. Se sigue la vela "
             "visible mas a la derecha; no se puede verificar su hora.\n\n"
             "INICIAR valida la cuenta demo y habilita operaciones: CALL pulsa Sube "
@@ -906,7 +911,32 @@ class App:
         self.gate = gate
         self.last_reference_center = None
         self.last_reference_at = None
+        self.visual_reference = LiveCandleReference(colors)
         self.tick()
+
+    def locate_visual_reference(self, image: Image.Image) -> tuple[float, float]:
+        if self.gate is None:
+            raise RuntimeError("Detector no iniciado.")
+        if self.visual_reference is None:
+            self.visual_reference = LiveCandleReference(self.candle_colors)
+        try:
+            return self.visual_reference.locate(
+                image, time.monotonic(), int(time.time() // self.gate.period),
+            )
+        except ReferenceUnavailable as exc:
+            raise TrackingUnavailable(str(exc)) from exc
+        finally:
+            self.reference_status.set(self.visual_reference.report)
+            result = self.visual_reference.result
+            if result is not None:
+                state = (result.spatial_agreement, result.point_state, result.point_search_stage)
+                if state != getattr(self, "last_visual_state", None):
+                    LOGGER.info("Referencia OpenCV: %s", self.visual_reference.report)
+                    self.last_visual_state = state
+
+    def reference_preview(self, image: Image.Image, band: tuple[float, float] | None) -> Image.Image:
+        annotated = self.visual_reference.image if self.visual_reference is not None else None
+        return make_preview(annotated if annotated is not None else image, band, "white")
 
     def tick(self) -> None:
         if self.gate is None or self.region is None:
@@ -917,9 +947,9 @@ class App:
                 raise RuntimeError("Monitor desconectado o cambiado. Recalibra antes de reiniciar.")
             image = ImageGrab.grab(bbox=self.region, all_screens=True)
             try:
-                candle_range = current_candle_reference(image, self.candle_colors)
+                candle_range = self.locate_visual_reference(image)
             except TrackingUnavailable:
-                preview = make_preview(image, None, "white")
+                preview = self.reference_preview(image, None)
                 self.update_preview(preview)
                 raise
             # Recortar el trabajo de reconocimiento sin cortar flechas anchas.
@@ -932,7 +962,7 @@ class App:
                 (candle_range[0] - left, candle_range[1] - left),
                 diagnostics,
             )
-            preview = make_preview(image, candle_range, "white")
+            preview = self.reference_preview(image, candle_range)
             self.update_preview(preview)
             timestamp = time.time()
             reference_center = sum(candle_range) / 2
@@ -963,7 +993,7 @@ class App:
             if registered and detection is not None:
                 pending = self.ledger.pending()
                 LOGGER.info(
-                    "Senal %s validada score=%.3f demo_armada=%s pendiente=%s punto_blanco_x=%.1f franja=%s",
+                    "Senal %s validada score=%.3f demo_armada=%s pendiente=%s vela_actual_x=%.1f franja=%s",
                     detection.signal, detection.score, self.execution.armed,
                     pending["id"] if pending is not None else None,
                     reference_center, candle_range,
@@ -975,7 +1005,8 @@ class App:
                 if self.execution.armed and pending is None:
                     fresh = ImageGrab.grab(bbox=self.region, all_screens=True)
                     image = fresh
-                    fresh_range = current_candle_reference(fresh, self.candle_colors)
+                    fresh_range = self.locate_visual_reference(fresh)
+                    self.update_preview(self.reference_preview(fresh, fresh_range))
                     fresh_detection = detect(fresh, self.templates, fresh_range)
                     if (
                         abs(sum(fresh_range) / 2 - reference_center) > 2
@@ -1020,7 +1051,7 @@ class App:
                         f"{self.gate.consecutive}/3 capturas consecutivas."
                     )
                 else:
-                    self.status.set("Punto blanco alineado con la vela actual. Sin compras.")
+                    self.status.set("Linea roja, vela y punto confirmados. Sin compras.")
             if detection is not None:
                 reason = (
                     "ya registrada en este intervalo" if self.gate.emitted else
@@ -1039,36 +1070,21 @@ class App:
             if report != getattr(self, "last_detection_report", None):
                 LOGGER.warning("%s", report)
                 self.last_detection_report = report
-            transient = (
-                image is not None and reference_loss_is_transient(
-                    image, self.gate,
-                    getattr(self, "last_reference_center", None),
-                    getattr(self, "last_reference_at", None),
-                    time.time(), time.monotonic(),
-                )
-            )
-            if not transient:
-                self.last_reference_center = None
-                self.last_reference_at = None
-                self.gate.armed = False
+            self.last_reference_center = None
+            self.last_reference_at = None
+            self.gate.armed = False
             self.gate.absent = 0
             self.gate.candidate = None
             self.gate.consecutive = 0
-            self.signal_text.set(
-                "REFERENCIA INESTABLE / VALIDACION REINICIADA\nSIN ENTRADA"
-                if transient else "ESPERANDO VELA / SIN AVISO"
-            )
+            self.signal_text.set("ESPERANDO VELA / SIN AVISO")
             self.signal_panel.configure(fg="gray")
-            self.status.set(
-                f"Referencia temporal; se conserva el rearme, pero vuelve a 1/3. {exc}"
-                if transient else str(exc)
-            )
+            self.status.set(str(exc))
         except EntryWindowExpired as exc:
             LOGGER.warning("Entrada omitida por tiempo; detector sigue activo: %s", exc)
             self.summary_text.set(self.statistics_summary())
             self.order_status.set(f"Sin entrada por tiempo vencido: {exc}")
             self.status.set("Tiempo de entrada vencido. Esperando una nueva senal.")
-        except (OSError, ValueError, RuntimeError, BrowserError, sqlite3.Error) as exc:
+        except (OSError, ValueError, RuntimeError, BrowserError, sqlite3.Error, cv2.error) as exc:
             LOGGER.exception("Detector detenido por error; sin reintentar ordenes")
             self.stop()
             self.order_status.set(f"DEMO DETENIDA: {exc}")
@@ -1158,6 +1174,8 @@ class App:
             self.root.after_cancel(self.job)
             self.job = None
         self.gate = None
+        self.visual_reference = None
+        self.last_visual_state = None
         self.last_detection_report = None
         self.execution.armed = False
         self.order_status.set("Ejecucion DESARMADA. No cancela posiciones enviadas.")

@@ -11,13 +11,16 @@ python bot.py
 
 Si Python no esta en PATH, usa la ruta completa de tu interprete.
 
-## Detectores experimentales offline (sin integracion con el bot)
+## Detectores OpenCV y pruebas offline
 
 [candle_tracker.py](candle_tracker.py) usa OpenCV/HSV para probar por separado
 la linea roja vertical de expiracion, la ultima vela de una serie regular
 y un punto blanco compacto cerca de ella. No importa `bot.py`, no abre el
-navegador y no envia operaciones. La logica principal no utiliza este modulo.
-Las dependencias opcionales estan en [requirements_tracker.txt](requirements_tracker.txt).
+navegador y no envia operaciones. El bot utiliza estos detectores mediante
+[live_candle_reference.py](live_candle_reference.py), con una validacion
+estricta adicional para permitir el reconocimiento de flechas.
+Las dependencias estan en [requirements.txt](requirements.txt);
+[requirements_tracker.txt](requirements_tracker.txt) incluye ese mismo archivo.
 
 ```powershell
 Set-Location 'D:\07 - Script'
@@ -76,6 +79,8 @@ La confianza global pondera vela 40%, punto 35%, expiracion 25% y agrega
 3 puntos porcentuales si coinciden espacialmente. Objetos ausentes aportan
 cero y sin coincidencia completa el score no supera 69%. Las detecciones
 parciales se conservan para debug; no autorizan entradas.
+En vivo se exigen los tres objetos actuales y coincidencia espacial,
+confidence global >=80%, vela >=70%, punto >=65% y linea >=70%.
 Los scores son heuristicas de calidad visual, **no probabilidades calibradas**
 ni garantia de identificar la vela en tiempo real. La linea se identifica
 por color/forma, sin leer su etiqueta; otros disenos requieren validacion.
@@ -97,7 +102,7 @@ de desplazamiento, perdida y readquisicion usan secuencias sinteticas.
 
 ### Dos posiciones de la vela respecto a la linea roja
 
-El detector experimental contempla tanto el cuerpo a la izquierda de la
+El detector contempla tanto el cuerpo a la izquierda de la
 linea roja como el cuerpo atravesado por esa linea (captura de apertura).
 En el segundo caso, el punto puede estar a la derecha de la linea sin ser
 rechazado: debe seguir cerca del centro y del rango vertical de la vela.
@@ -129,7 +134,9 @@ superior sin el icono inferior.
    Para cambiar temporalidad, detiene el bot, cambia el grafico y el selector,
    recalibra las muestras/zona si cambia su aspecto y pulsa INICIAR.
 3. Carga [el indicador QCS](ema_rsi_iq_option.lua), calibra las dos muestras
-   de flechas y selecciona un solo grafico en tiempo real.
+   de flechas y selecciona SOLO el grafico en tiempo real: incluye al menos
+   tres velas completas, espacio de flechas, punto blanco y linea roja.
+   Excluye botones, textos de la interfaz y paneles laterales.
 4. Pulsa **INICIAR detector y operaciones DEMO** y confirma el inicio.
    Valida la cuenta demo y configuracion del grafico antes de habilitar
    detector y entradas; ya no hay un boton ARMAR separado. Si falla,
@@ -178,36 +185,39 @@ La vista previa muestra cada nueva captura del grafico durante el
 seguimiento normal (intervalo de 100 ms mas el tiempo de procesamiento),
 sin parpadeo. El marco blanco sigue la vela actual identificada.
 Las lineas se dibujan despues de reducir la vista para conservar su grosor.
-Blanco indica una franja estrecha centrada en el punto blanco de precio.
-Primero se busca un unico nucleo blanco compacto de 2 a 12 pixeles por eje
-(RGB de 229 a 255 por canal). Se excluye el brillo tenue que puede unirlo
-a un segmento discontinuo. La linea horizontal debe tener soporte y
-contraste con el fondo a ambos lados; puede cambiar de color entre lados.
-El punto sirve de ancla para escoger la serie de velas y debe estar alineado con el centro
-de la ultima vela de la secuencia (tolerancia maxima de 3 pixeles).
-No se exige movimiento del cuerpo/mecha. Si falta el punto, hay varios
-candidatos, no coincide con la vela o no se identifica una secuencia fiable,
-se muestra el grafico sin lineas y se bloquean las entradas.
-Si el seguimiento indica que la nueva vela aun no es identificable, la
-vista en vivo continua sin marco; no se emiten senales ni entradas hasta
-recuperar un seguimiento fiable.
-El seguimiento admite cuerpos de un pixel de altura y agrupa fragmentos
-de cuerpo/mecha dentro de una misma posicion del espaciado de velas.
-Conserva los rechazos de objetos anchos, series ambiguas y posiciones
-irregulares. Sigue siendo reconocimiento por imagen: una vela sin pixeles
-del color configurado no se puede confirmar, y el grafico debe estar en vivo.
+La vista anota linea de expiracion (magenta), bounding box (cian), cuerpo
+(amarillo), mechas (azul/naranja) y punto (circulo blanco). La franja blanca
+se centra en la vela, con tolerancia maxima de 3 pixeles para las flechas;
+un punto descentrado no desplaza esa franja.
+El panel muestra confianza visual, color, coordenadas y movimiento del punto.
+Se usa toda la zona manual seleccionada como ROI, sin recortar porcentajes
+de encabezado/pie como en las pruebas offline.
+Los inputs de colores del bot siguen definiendo los colores de los cuerpos
+y mechas (tolerancia 24 por canal); linea y punto usan filtros HSV.
+No se exige movimiento. La referencia necesita los tres objetos visibles,
+su coincidencia espacial y los umbrales de confianza indicados arriba.
+Ante perdida de cualquiera, se muestran las detecciones parciales pero
+se bloquean flechas/entradas y se borra la validacion y el rearme de senal.
+El detector y la ejecucion DEMO permanecen activos, buscando otra referencia
+valida; no se sustituye un punto ausente por su coordenada anterior.
+El tracker de punto busca localmente y amplia si falla; vuelve a adquirirlo
+si hace falta. Al cambiar de intervalo se reinicia el tracker para no
+heredar el punto de la vela anterior. INICIAR y DETENER tambien lo reinician.
+Un cuerpo de menos de tres filas coloreadas aun no se confirma: no se
+autoriza una entrada sobre una vela apenas visible o sin cuerpo medible.
 Una flecha CALL/PUT nueva dentro de la franja actual puede habilitar una
 entrada aunque el cuerpo de la vela este quieto. Se mantienen dos capturas
 sin flecha para rearmar, tres capturas consecutivas de reconocimiento y
 como maximo una senal por intervalo. Las flechas presentes al iniciar y
 las centradas fuera de la referencia no habilitan entradas. Un desplazamiento
-del punto mayor de 3 pixeles reinicia el rearme; antes de solicitar la orden
-se toma otra captura y se exige el mismo punto y direccion de flecha.
-Un fallo aislado de seguimiento de hasta 1 segundo conserva el rearme solo
-si el punto blanco reaparece en la misma posicion y dentro del mismo
-intervalo. Aun asi borra el candidato y vuelve a exigir tres reconocimientos
-consecutivos. Si falta el punto, se mueve, cambia el intervalo o se supera
-ese segundo, se desarma como antes y se requiere rearmado.
+de la vela mayor de 3 pixeles reinicia el rearme; antes de solicitar la orden
+se toma otra captura y se exige de nuevo linea, vela, punto, coincidencia
+y confianza, con centro de vela a no mas de 2 pixeles del anterior y la misma
+direccion de flecha. No exige la misma coordenada Y del punto: puede moverse
+con el precio. Ante perdida de referencia siempre se vuelve a exigir dos
+capturas validas sin flecha y tres reconocimientos consecutivos.
+Se conserva el contador Intentos y la continuidad al vencer el tiempo de
+entrada; no se convierten fallos visuales en intentos por tiempo.
 La comprobacion es visual, no prueba la hora de la vela ni garantiza ausencia
 de falsos positivos. Los limites de tamano se deben verificar con el zoom
 real; no se relajan automaticamente tras errores. Se conservan las comprobaciones
@@ -318,8 +328,8 @@ capturas consecutivas y el bloqueo de flechas ya visibles al cambiar de vela.
 El umbral del 70 % permite mayor variacion de forma, pero aumenta el riesgo
 de aceptar figuras que no sean flechas respecto al umbral anterior del 88 %.
 Las tres capturas usan ahora pausas de 100 ms: al menos 200 ms entre la
-primera y la tercera, mas el procesamiento. Las mascaras de color se
-calculan con Pillow; la mascara de velas valida la posicion del punto blanco.
+primera y la tercera, mas el procesamiento. Las mascaras de flechas se
+calculan con Pillow; OpenCV detecta linea, vela y punto para validar la referencia.
 La preparacion reutiliza la configuracion recien leida por submit; si se
 cambia Tiempo, vuelve a leerla despues del ajuste. Si Tiempo ya coincide
 con el cierre, no se repite la lectura completa durante su preparacion.
@@ -341,13 +351,14 @@ Una vez resuelta, vuelve a pulsar INICIAR para activar nuevas entradas.
 ## Pruebas desde VS Code
 
 La configuracion de `.vscode/settings.json` habilita unittest y descubre
-`test_*.py` en el panel Testing. Selecciona el interprete con Pillow y
-Playwright instalados, actualiza el descubrimiento y ejecuta las pruebas.
+`test_*.py` en el panel Testing. Selecciona el interprete con Pillow,
+Playwright, NumPy y OpenCV instalados, actualiza el descubrimiento y ejecuta las pruebas.
 No requieren abrir IQ Option ni enviar ordenes. Tambien pueden ejecutarse
 desde la terminal integrada:
 
 ```powershell
 python -m unittest -q test_bot test_demo_execution
+python -m unittest -q test_live_candle_reference test_expiration_line test_candle_detector test_white_point test_candle_tracker
 ```
 
 Las regresiones cubren cuerpos diminutos, franjas de seguimiento,

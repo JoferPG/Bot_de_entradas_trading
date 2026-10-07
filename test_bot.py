@@ -216,6 +216,15 @@ class TrackingTests(unittest.TestCase):
             signal: template_from(arrow_image(signal), signal)
             for signal in ("CALL", "PUT")
         }
+        # Aislar las regresiones antiguas de flechas/rearme del nuevo extractor visual.
+        reference_patch = patch.object(
+            App, "locate_visual_reference",
+            lambda app, image: current_candle_reference(image, app.candle_colors),
+        )
+        preview_patch = patch.object(App, "reference_preview", lambda app, image, band: make_preview(image, band, "white"))
+        for patcher in (reference_patch, preview_patch):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def chart(self, centers, current_signal=None):
         image = Image.new("RGB", (250, 200), "#101827")
@@ -519,7 +528,7 @@ class TrackingTests(unittest.TestCase):
         app.preview_panel.configure.assert_called_once_with(image=photo.return_value)
         app.execution.submit.assert_not_called()
 
-    def test_brief_tracking_loss_keeps_armed_but_restarts_three_frame_count(self):
+    def test_brief_tracking_loss_disarms_and_restarts_three_frame_count(self):
         app = App.__new__(App)
         app.gate = SignalGate(300)
         timestamp = 1800000002.0
@@ -550,10 +559,10 @@ class TrackingTests(unittest.TestCase):
             patch("bot.list_monitors", return_value=app.monitors),
         ):
             app.tick()
-        self.assertTrue(app.gate.armed)
+        self.assertFalse(app.gate.armed)
         self.assertIsNone(app.gate.candidate)
         self.assertEqual(app.gate.consecutive, 0)
-        self.assertIn("se conserva el rearme", app.status.set.call_args.args[0])
+        self.assertIn("Esperando", app.status.set.call_args.args[0])
         app.execution.submit.assert_not_called()
 
     def test_transient_tracking_grace_rejects_expired_or_moved_reference(self):
