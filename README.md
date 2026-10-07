@@ -124,6 +124,141 @@ superior sin el icono inferior.
 
 ## Uso
 
+### Analisis visual de EMA y filtro de entradas
+
+[ema_analyzer.py](ema_analyzer.py) reconoce las curvas que ya dibuja la
+plataforma: EMA 9 cian/azul y EMA 21 amarillo/naranja. No calcula medias
+desde precios ni genera ordenes por si solo. Tras verificarlo en tiempo real,
+se habilito como filtro de las flechas existentes:
+
+- CALL requiere EMA `BULLISH` con confianza >= `EMA_MIN_CONFIDENCE`.
+- PUT requiere EMA `BEARISH` con esa misma confianza minima.
+- `CROSSING`, `SIDEWAYS`, `UNKNOWN`, errores, ausencia o datos desactualizados
+  bloquean entradas. No se opera exclusivamente por cruces EMA.
+
+Se conservan tres capturas consecutivas de flecha, rearme por dos ausencias,
+referencia de vela/punto/linea, una senal por intervalo y protecciones DEMO.
+Cada captura que cuenta para validar la flecha debe superar el filtro EMA;
+un bloqueo reinicia ese conteo, pero NO cuenta como ausencia para rearmar.
+Si las EMA se recuperan y la flecha sigue presente, debe cumplir otras tres
+capturas compatibles, siempre que ya hubiera rearme valido.
+Antes de `submit` se toma una captura nueva y se revalidan referencia,
+flecha y EMA. Si el filtro falla entonces, no se envia solicitud y no se
+reintenta esa senal en el mismo intervalo. El detector y DEMO siguen activos.
+Los bloqueos EMA no suman Intentos (reservado a vencimientos de ejecucion).
+La confianza visual no garantiza rentabilidad. No se modifico el mecanismo
+web que envia el clic; las EMA se verifican antes de entrar en su preparacion,
+no de forma continua mientras el navegador prepara la orden.
+
+Primero se probo el modulo independiente con la captura compartida de
+1000x289: EMA 9 encima de EMA 21 al extremo derecho, ambas pendientes
+positivas, distancia aproximada 68px, BULLISH, confianza aproximada 92%.
+Se genero `captura_ema.debug.png` y su JSON; se verificaron tambien escalas
+0.75, 1 y 1.5. La captura contiene un cruce historico visible, pero una sola
+imagen no confirma un cruce temporal nuevo.
+
+```powershell
+python test_ema_analyzer.py --image "C:\ruta\captura.png" --output "captura_ema.debug.png"
+```
+
+Genera PNG anotado y JSON con trayectoria, medidas, factores de confianza,
+estado, timestamp y evento de cruce. No altera la captura original.
+Si la captura contiene interfaz, selecciona el grafico con
+`--roi "x1,y1,x2,y2"`. Sin ROI se analiza la imagen completa; la captura
+compartida ya contiene solo grafico. Una curva extensa de igual color de
+otro indicador no puede identificarse como EMA por color solamente:
+otras curvas comparables del mismo color se rechazan como ambiguas.
+Evita incluir leyendas, controles o multiples graficos en la ROI.
+
+Para probar seguimiento/cruces necesitas imagenes consecutivas, en orden:
+
+```powershell
+python test_ema_analyzer.py --image "frame1.png" --next-image "frame2.png" --next-image "frame3.png" --frame-interval 0.2
+python -m unittest test_ema_analyzer test_live_candle_reference
+```
+
+El intervalo representa el tiempo real entre capturas; no reproduce tiempo
+real ni inventa movimiento de una unica imagen. UNKNOWN sale con codigo 2
+y motivo explicito; errores de archivo/configuracion con codigo 1.
+Los tests de la captura compartida se activan con `IQ_OPTION_EMA_IMAGE`.
+
+La segmentacion HSV usa mascaras independientes y cierre morfologico 3x3
+para conservar lineas de un pixel. Descarta componentes cortos, gruesos,
+verticales o trayectorias ambiguas; une segmentos compatibles y solo
+interpola huecos pequenos. No extrapola una curva hacia columnas sin evidencia.
+Se mide la relacion en las ultimas cinco columnas comunes; `analysis_x`
+indica el extremo analizado, no una coordenada fija ni un precio.
+Los extremos de ambas curvas deben coincidir dentro de la tolerancia de hueco.
+
+Y menor significa precio visual mayor: `ABOVE` es EMA 9 por encima.
+La pendiente numerica es el negativo de la regresion de Y respecto a X
+sobre una ventana reciente: POSITIVE significa ascendente en precio visual.
+Se expresa en px verticales por px horizontal, no en unidades monetarias.
+
+Los ajustes documentados estan en [config.py](config.py):
+
+| Ajuste | Default | Interpretacion |
+|---|---|---|
+| `EMA_FAST_HSV_LOW/HIGH` | (85,140,140)/(115,255,255) | Cian/azul; H OpenCV 0..179 |
+| `EMA_SLOW_HSV_LOW/HIGH` | (10,140,140)/(38,255,255) | Amarillo/naranja saturado |
+| `EMA_SLOPE_LOOKBACK` | 100 | Columnas comunes recientes para regresion |
+| `EMA_SLOPE_FLAT_MARGIN` | 0.03 | Banda neutra en px/px |
+| `EMA_RELATION_MARGIN_PX` | 2 | Diferencias menores se consideran TOUCHING |
+| `EMA_CLOSE_DISTANCE_PX` | 4 | CLOSE hasta 4px, inclusive |
+| `EMA_SEPARATED_DISTANCE_PX` | 12 | SEPARATED desde 12px; intermedio NORMAL |
+| `EMA_DISTANCE_CHANGE_MARGIN_PX` | 1 | Cambio minimo entre frames para expansion/contraccion |
+| `EMA_MIN_POINTS` | 80 | Columnas observadas minimas por curva y comunes |
+| `EMA_MIN_SEGMENT_WIDTH` | 20 | Ancho minimo de componente |
+| `EMA_MAX_LINE_THICKNESS_PX` | 6 | Limite de grosor para excluir bloques/velas |
+| `EMA_MAX_GAP_PX` | 28 | Hueco maximo interpolado; captura: 14px nativa, 25px a 1.5x |
+| `EMA_MAX_STEP_SLOPE` | 2 | Maximo cambio local vertical/horizontal |
+| `EMA_TRACK_RADIUS_PX` | 12 | Busqueda alrededor de trayectoria previa |
+| `EMA_RECOVERY_RADIUS_PX` | 36 | Busqueda ampliada si falla seguimiento |
+| `EMA_RECALIBRATION_FRAMES` | 3 | Perdidas antes de volver a busqueda completa |
+| `EMA_MAX_FRAME_GAP_SECONDS` | 1 | Reinicia seguimiento tras discontinuidad temporal |
+| `EMA_CROSS_CONFIRMATION_FRAMES` | 3 | Frames para establecer cada lado del cruce |
+| `EMA_MIN_CONFIDENCE` | 75 | Minimo 0..100; por debajo, UNKNOWN |
+| `EMA_ENTRY_FILTER_ENABLED` | True | Exige BULLISH para CALL o BEARISH para PUT |
+| `EMA_CONFIDENCE_WEIGHTS` | .20,.25,.20,.15,.20 | Color, continuidad, puntos, temporal, relacion |
+
+Estos son umbrales visuales iniciales para la captura proporcionada, no
+valores universales ni recomendaciones de trading. Distancias/grosor/huecos
+son pixeles: revisalos al cambiar zoom, resolucion, colores o DPI.
+El limite de hueco se ajusto a oclusiones medidas, no para unir tramos
+arbitrariamente separados. La confianza es calidad visual, no probabilidad
+de acertar una operacion. Sin historial, el factor temporal vale 0.5;
+no se presenta una captura como seguimiento confirmado.
+
+Estados: BULLISH exige ABOVE y ambas pendientes POSITIVE sin contraccion
+significativa; BEARISH exige BELOW y ambas NEGATIVE sin contraccion.
+TOUCHING o una inversion pendiente/confirmada producen CROSSING, salvo
+lineas cercanas y planas (SIDEWAYS). Si las direcciones no apoyan una tendencia
+conjunta, se clasifica SIDEWAYS. Falta/ambiguedad/baja confianza produce UNKNOWN.
+`distance_increasing` es null en el primer frame.
+
+Un cruce temporal requiere establecer un lado durante tres frames y luego
+el otro lado durante tres frames fiables consecutivos. CALL/PUT en
+`crossover_detected` solo describe la direccion del cruce, no una orden.
+Se emite una vez al confirmar la inversion, no mientras continua separandose.
+`previous_relation` conserva el lado previamente confirmado;
+`crossover_timestamp` usa segundos monotonos (en CLI tiempo simulado).
+Una perdida rompe la persistencia y no permite inferir un cruce a traves
+de frames ausentes. `spatial_crossing` solo indica interseccion historica
+en la trayectoria visible, y no dispara ese evento temporal.
+
+En vivo [live_ema_analysis.py](live_ema_analysis.py) adapta screenshots PIL,
+conserva el seguimiento y entrega `App.ema_result`. El panel muestra medidas,
+estado, confianza, busqueda y errores aunque no pueda confirmarse una vela.
+Con `DEBUG_MODE = True` se dibujan curvas, puntos y etiquetas en la vista
+previa; con False permanece el panel sin overlay.
+`EMA_ENTRY_FILTER_ENABLED = False` y reiniciar vuelve al analisis informativo
+y al criterio de entradas anterior. Desactivar el analisis tambien requiere
+desactivar explicitamente ese filtro: INICIAR rechaza un filtro habilitado
+con `EMA_ANALYSIS_ENABLED = False`, para no operar sin evidencia.
+INICIAR/DETENER, cambio de tamano/ROI o hueco temporal reinician seguimiento.
+Las coordenadas retenidas solo guian la busqueda: no se publican como deteccion
+actual cuando se pierden las lineas.
+
 1. El bot abre una ventana dedicada de Microsoft Edge con su perfil local
    anterior. Inicia sesion manualmente si hace falta; no crea una cuenta.
    No utiliza el navegador predeterminado ni tu perfil habitual.

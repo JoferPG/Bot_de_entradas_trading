@@ -43,8 +43,17 @@ from playwright.sync_api import Error as BrowserError
 from demo_execution import DemoBrowser, DemoExecution, EntryWindowExpired, Ledger
 from monitors import Monitor, enable_physical_coordinates, list_monitors, place_selector
 from live_candle_reference import LiveCandleReference, ReferenceUnavailable
+from live_ema_analysis import LiveEMAAnalysis
+from ema_analyzer import EMAResult, report as ema_report
+import config
 
 Signal = Literal["CALL", "PUT"]
+
+
+class EMAEntryBlocked(RuntimeError):
+    pass
+
+
 Box = tuple[int, int, int, int]
 Point = tuple[int, int]
 COLORS: dict[Signal, tuple[int, int, int]] = {
@@ -599,6 +608,9 @@ class App:
         self.candle_colors = (parse_color("#2D9E6B"), parse_color("#E44A4E"))
         self.visual_reference: LiveCandleReference | None = None
         self.reference_status = tk.StringVar(value="Referencia: pendiente")
+        self.ema_analysis: LiveEMAAnalysis | None = None
+        self.ema_result: EMAResult | None = None
+        self.ema_status = tk.StringVar(value="EMA: pendiente.")
         self.signal_text = tk.StringVar(value="SIN SENAL ACTUAL")
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.browser = DemoBrowser()
@@ -689,6 +701,7 @@ class App:
         self.preview_panel = tk.Label(content)
         self.preview_panel.pack(pady=3)
         tk.Label(content, textvariable=self.reference_status, wraplength=430, justify="left").pack(pady=3)
+        tk.Label(content, textvariable=self.ema_status, wraplength=430, justify="left").pack(pady=3)
         tk.Label(content, textvariable=self.status, wraplength=430).pack(padx=12, pady=8)
         tk.Label(content, text=f"Registro local: {self.log_path}", wraplength=430).pack(pady=5)
         root.bind("<Escape>", lambda _event: self.stop())
@@ -873,6 +886,9 @@ class App:
             if period not in (60, 300):
                 raise ValueError("Selecciona 1 minuto (60) o 5 minutos (300).")
             gate = SignalGate(period)
+            if config.EMA_ENTRY_FILTER_ENABLED and not config.EMA_ANALYSIS_ENABLED:
+                raise ValueError("El filtro de entradas EMA requiere EMA_ANALYSIS_ENABLED = True.")
+            ema_analysis = LiveEMAAnalysis() if config.EMA_ANALYSIS_ENABLED else None
             colors = (parse_color(self.green_candle.get()), parse_color(self.red_candle.get()))
             if colors[0] == colors[1]:
                 raise ValueError("Las velas alcistas y bajistas necesitan colores distintos.")
@@ -884,6 +900,9 @@ class App:
             "La zona debe excluir botones e incluir la linea roja, el punto blanco y al menos tres velas visibles "
             "de un solo grafico. El grafico debe estar EN TIEMPO REAL. Se sigue la vela "
             "visible mas a la derecha; no se puede verificar su hora.\n\n"
+            + ("Filtro EMA activo: CALL requiere BULLISH; PUT requiere BEARISH. "
+               "CROSSING, SIDEWAYS y UNKNOWN bloquean entradas.\n\n"
+               if config.EMA_ENTRY_FILTER_ENABLED else "") +
             "INICIAR valida la cuenta demo y habilita operaciones: CALL pulsa Sube "
             f"y PUT pulsa Baja al cierre de la vela de {period // 60} minuto(s) (Colombia). "
             "Usa el importe configurado en la web. Se detiene tras 3 perdidas "
@@ -912,7 +931,44 @@ class App:
         self.last_reference_center = None
         self.last_reference_at = None
         self.visual_reference = LiveCandleReference(colors)
+        self.ema_analysis = ema_analysis
+        self.ema_result = None
+        self.ema_status.set("EMA: esperando captura." if ema_analysis else "EMA: desactivado.")
         self.tick()
+
+    def update_ema_analysis(self, image: Image.Image) -> None:
+        analysis = getattr(self, "ema_analysis", None)
+        self.ema_result = None
+        if analysis is None:
+            return
+        try:
+            self.ema_result = analysis.update(image, time.monotonic())
+            mode = "Filtro de entradas activo." if config.EMA_ENTRY_FILTER_ENABLED else "Solo informacion."
+            self.ema_status.set(ema_report(self.ema_result) + "\n" + mode)
+        except (ValueError, cv2.error) as exc:
+            self.ema_analysis_failed(analysis, exc)
+
+    def ema_analysis_failed(self, analysis: LiveEMAAnalysis, exc: ValueError | cv2.error) -> None:
+        LOGGER.exception("Analisis EMA no disponible; UNKNOWN")
+        analysis.reset()
+        self.ema_result = None
+        self.ema_status.set(f"EMA: UNKNOWN; error: {exc}.")
+
+    def ema_entry_block_reason(self, direction: Signal) -> str:
+        if not config.EMA_ENTRY_FILTER_ENABLED:
+            return ""
+        result = getattr(self, "ema_result", None)
+        if not config.EMA_ANALYSIS_ENABLED or getattr(self, "ema_analysis", None) is None or result is None:
+            return "EMA no disponible; sin entrada."
+        age = time.monotonic() - result.timestamp
+        if not math.isfinite(age) or not 0 <= age <= config.EMA_MAX_FRAME_GAP_SECONDS:
+            return "EMA desactualizada; sin entrada."
+        if not math.isfinite(result.confidence) or result.confidence < config.EMA_MIN_CONFIDENCE:
+            return f"Confianza EMA insuficiente ({result.confidence:.0f}%); sin entrada."
+        expected = "BULLISH" if direction == "CALL" else "BEARISH"
+        if result.market_state != expected:
+            return f"{direction} requiere EMA {expected}; estado {result.market_state}. Sin entrada."
+        return ""
 
     def locate_visual_reference(self, image: Image.Image) -> tuple[float, float]:
         if self.gate is None:
@@ -936,7 +992,14 @@ class App:
 
     def reference_preview(self, image: Image.Image, band: tuple[float, float] | None) -> Image.Image:
         annotated = self.visual_reference.image if self.visual_reference is not None else None
-        return make_preview(annotated if annotated is not None else image, band, "white")
+        preview = annotated if annotated is not None else image
+        analysis = getattr(self, "ema_analysis", None)
+        if analysis is not None:
+            try:
+                preview = analysis.overlay(preview)
+            except (ValueError, cv2.error) as exc:
+                self.ema_analysis_failed(analysis, exc)
+        return make_preview(preview, band, "white")
 
     def tick(self) -> None:
         if self.gate is None or self.region is None:
@@ -946,6 +1009,7 @@ class App:
             if self.monitors[self.monitor_index] not in list_monitors():
                 raise RuntimeError("Monitor desconectado o cambiado. Recalibra antes de reiniciar.")
             image = ImageGrab.grab(bbox=self.region, all_screens=True)
+            self.update_ema_analysis(image)
             try:
                 candle_range = self.locate_visual_reference(image)
             except TrackingUnavailable:
@@ -981,6 +1045,13 @@ class App:
                 registered = False
             else:
                 registered = self.gate.observe(timestamp, detection)
+            ema_block = self.ema_entry_block_reason(detection.signal) if detection is not None else ""
+            if ema_block:
+                if registered:
+                    self.gate.emitted = False
+                registered = False
+                self.gate.candidate = None
+                self.gate.consecutive = 0
             self.show_signal(
                 detection,
                 detection is not None
@@ -1005,6 +1076,7 @@ class App:
                 if self.execution.armed and pending is None:
                     fresh = ImageGrab.grab(bbox=self.region, all_screens=True)
                     image = fresh
+                    self.update_ema_analysis(fresh)
                     fresh_range = self.locate_visual_reference(fresh)
                     self.update_preview(self.reference_preview(fresh, fresh_range))
                     fresh_detection = detect(fresh, self.templates, fresh_range)
@@ -1016,6 +1088,9 @@ class App:
                         raise TrackingUnavailable(
                             "Entrada cancelada: punto blanco o flecha cambio antes del clic."
                         )
+                    final_ema_block = self.ema_entry_block_reason(detection.signal)
+                    if final_ema_block:
+                        raise EMAEntryBlocked("Captura final: " + final_ema_block)
                     LOGGER.info("Intentando entrada %s al cierre; periodo=%s", detection.signal, self.running_period)
                     identity = self.execution.submit(
                         detection.signal, timestamp, self.running_period,
@@ -1062,9 +1137,21 @@ class App:
                 report = f"{detection.signal} reconocida: {reason}"
             else:
                 report = " | ".join(diagnostics) if diagnostics else "Sin figuras del color esperado en vela actual"
+            if ema_block:
+                report = ema_block
+                self.status.set(ema_block)
+                self.order_status.set(ema_block)
+                self.signal_text.set(f"{detection.signal} / BLOQUEADA POR EMA")
+                self.signal_panel.configure(fg="#B36B00")
             if report != getattr(self, "last_detection_report", None):
                 LOGGER.info("Reconocimiento: %s", report)
                 self.last_detection_report = report
+        except EMAEntryBlocked as exc:
+            LOGGER.warning("Entrada bloqueada por EMA: %s", exc)
+            self.status.set(str(exc))
+            self.order_status.set(str(exc))
+            self.signal_text.set("SIN ENTRADA / EMA CAMBIO")
+            self.signal_panel.configure(fg="#B36B00")
         except TrackingUnavailable as exc:
             report = f"Entrada bloqueada por referencia: {exc}"
             if report != getattr(self, "last_detection_report", None):
@@ -1175,6 +1262,10 @@ class App:
             self.job = None
         self.gate = None
         self.visual_reference = None
+        self.ema_analysis = None
+        self.ema_result = None
+        if hasattr(self, "ema_status"):
+            self.ema_status.set("EMA: detenido.")
         self.last_visual_state = None
         self.last_detection_report = None
         self.execution.armed = False

@@ -37,6 +37,7 @@ class RegionTests(unittest.TestCase):
         self.app.signal_panel = Mock()
         self.app.execution = Mock()
         self.app.order_status = Mock()
+        self.app.ema_status = Mock()
         self.app.region = None
         self.app.templates = {"CALL": Mock(), "PUT": Mock()}
         self.monitor = Monitor((0, 0, 400, 300), True)
@@ -164,6 +165,17 @@ class RegionTests(unittest.TestCase):
         self.assertTrue(app.execution.armed)
         self.assertIn("DEMO ACTIVA", app.order_status.set.call_args.args[0])
 
+    @patch("config.EMA_ANALYSIS_ENABLED", False)
+    @patch("config.EMA_ENTRY_FILTER_ENABLED", True)
+    @patch("bot.messagebox.showerror")
+    def test_ema_filter_without_analysis_cannot_arm_or_start(self, error):
+        app = self.configured_start_app()
+        app.start()
+        app.execution.arm.assert_not_called()
+        app.tick.assert_not_called()
+        app.stop.assert_called_once()
+        self.assertIn("EMA_ANALYSIS_ENABLED", error.call_args.args[1])
+
     @patch("bot.messagebox.showerror")
     @patch("bot.messagebox.askokcancel", return_value=True)
     def test_failed_demo_validation_does_not_start_detector(self, confirm, error):
@@ -225,6 +237,9 @@ class TrackingTests(unittest.TestCase):
         for patcher in (reference_patch, preview_patch):
             patcher.start()
             self.addCleanup(patcher.stop)
+        ema_patch = patch("config.EMA_ENTRY_FILTER_ENABLED", False)
+        ema_patch.start()
+        self.addCleanup(ema_patch.stop)
 
     def chart(self, centers, current_signal=None):
         image = Image.new("RGB", (250, 200), "#101827")
