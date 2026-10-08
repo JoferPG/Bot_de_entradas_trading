@@ -6,9 +6,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from bot import App, SignalGate, template_from
+from bot import App, COLORS as ARROW_COLORS, SignalGate, arrow_shapes, detect, template_from
 from candle_tracker import load_image
 from live_candle_reference import LiveCandleReference, ReferenceUnavailable
 from live_ema_analysis import LiveEMAAnalysis
@@ -26,6 +26,27 @@ def pil_chart():
 
 
 class LiveReferenceTests(unittest.TestCase):
+    def setUp(self):
+        filter_patch = patch("config.EMA_ENTRY_FILTER_ENABLED", True)
+        filter_patch.start()
+        self.addCleanup(filter_patch.stop)
+
+    def test_disabled_ema_filter_allows_sideways_unknown_and_opposite_states(self):
+        with patch("config.EMA_ENTRY_FILTER_ENABLED", False):
+            for direction, state in (
+                ("CALL", "SIDEWAYS"), ("PUT", "SIDEWAYS"),
+                ("CALL", "UNKNOWN"), ("PUT", "UNKNOWN"),
+                ("CALL", "BEARISH"), ("PUT", "BULLISH"),
+            ):
+                with self.subTest(direction=direction, state=state):
+                    app = self.app()
+                    blank = self.ema_chart(state)
+                    arrow = self.ema_chart(state, direction)
+                    write = self.replay_ema_frames(app, [blank, blank, arrow, arrow, arrow, arrow])
+                    app.execution.submit.assert_called_once_with(direction, 1_800_000_002, 300)
+                    write.assert_called_once()
+                    self.assertIn("Solo informacion", app.ema_status.set.call_args.args[0])
+
     def ema_chart(self, state, direction=None):
         bgr = synthetic_chart()
         if state != "UNKNOWN":
@@ -44,7 +65,7 @@ class LiveReferenceTests(unittest.TestCase):
             cv2.polylines(bgr, [np.array(slow, np.int32)], False, (0, 170, 255), 1)
         image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         if direction:
-            image.paste(arrow_image(direction).crop((10, 10, 27, 27)), (342, 190))
+            image.paste(arrow_image(direction).crop((10, 10, 27, 34)), (342, 190))
         return image
 
     def replay_ema_frames(self, app, frames):
@@ -75,6 +96,26 @@ class LiveReferenceTests(unittest.TestCase):
                 app.execution.submit.assert_called_once_with(direction, 1_800_000_002, 300)
                 write.assert_called_once()
 
+    def test_17x24_and_logged_sizes_can_execute_against_23x27_template(self):
+        for direction, state in (("CALL", "BULLISH"), ("PUT", "BEARISH")):
+            for width in (17, 19, 20):
+                with self.subTest(direction=direction, width=width):
+                    app = self.app()
+                    sample = Image.new("RGB", (60, 60), "#101827")
+                    ImageDraw.Draw(sample).polygon(
+                        [(21, 5), (10, 31), (32, 31)], fill=ARROW_COLORS[direction],
+                    )
+                    app.templates[direction] = template_from(sample, direction)
+                    blank = self.ema_chart(state)
+                    arrow = blank.copy()
+                    left = 350-(width-1)//2
+                    ImageDraw.Draw(arrow).polygon(
+                        [(350, 190), (left, 213), (left+width-1, 213)],
+                        fill=ARROW_COLORS[direction],
+                    )
+                    self.replay_ema_frames(app, [blank, blank, arrow, arrow, arrow, arrow])
+                    app.execution.submit.assert_called_once_with(direction, 1_800_000_002, 300)
+
     def test_opposite_sideways_unknown_block_without_event_or_disarming(self):
         for direction, state in (
             ("CALL", "BEARISH"), ("PUT", "BULLISH"),
@@ -97,7 +138,7 @@ class LiveReferenceTests(unittest.TestCase):
                 app = self.app()
                 blank, arrow = self.ema_chart("BULLISH"), self.ema_chart("BULLISH", "CALL")
                 final = self.ema_chart(state, "CALL")
-                self.replay_ema_frames(app, [blank, blank, arrow, arrow, arrow, final])
+                self.replay_ema_frames(app, [blank, blank, arrow, final, arrow, arrow])
                 app.execution.submit.assert_not_called()
                 self.assertTrue(app.gate.emitted)
                 self.assertIn("Captura final", app.order_status.set.call_args.args[0])
@@ -130,23 +171,23 @@ class LiveReferenceTests(unittest.TestCase):
         with patch("bot.time.monotonic", return_value=10.1):
             self.assertIn("no disponible", app.ema_entry_block_reason("CALL"))
 
-    def test_ema_recovery_requires_three_matching_frames_without_false_rearm(self):
+    def test_ema_recovery_accepts_one_valid_frame_without_false_rearm(self):
         app = self.app()
         blank = self.ema_chart("BULLISH")
         blocked = self.ema_chart("UNKNOWN", "CALL")
         good = self.ema_chart("BULLISH", "CALL")
         with (
-            patch("bot.ImageGrab.grab", side_effect=[blank, blank, good, good, blocked, good, good, good, good]),
+            patch("bot.ImageGrab.grab", side_effect=[blank, blank, blocked, good, good]),
             patch("bot.list_monitors", return_value=app.monitors),
             patch("bot.ImageTk.PhotoImage"),
             patch("bot.time.time", return_value=1_800_000_002),
             patch("bot.time.monotonic", side_effect=itertools.count(10, .001)),
             patch("bot.write_event") as write,
         ):
-            for _ in range(7):
+            for _ in range(3):
                 app.tick()
                 app.execution.submit.assert_not_called()
-            self.assertEqual(app.gate.consecutive, 2)
+            self.assertEqual(app.gate.consecutive, 0)
             app.tick()
         app.execution.submit.assert_called_once()
         write.assert_called_once()
@@ -250,13 +291,13 @@ class LiveReferenceTests(unittest.TestCase):
         app.schedule_results = Mock()
         return app
 
-    def test_full_tick_requires_three_arrow_frames_and_fresh_three_objects(self):
+    def test_full_tick_accepts_first_arrow_frame_and_requires_fresh_three_objects(self):
         for final_missing in (False, True):
             with self.subTest(final_missing=final_missing):
                 app = self.app()
                 blank = pil_chart()
                 signal = blank.copy()
-                arrow = arrow_image().crop((10, 10, 27, 27))
+                arrow = arrow_image().crop((10, 10, 27, 34))
                 signal.paste(arrow, (342, 190))
                 final = signal.copy()
                 if final_missing:
@@ -265,7 +306,7 @@ class LiveReferenceTests(unittest.TestCase):
                     final = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
                     final.paste(arrow, (342, 190))
                 with (
-                    patch("bot.ImageGrab.grab", side_effect=[blank, blank, signal, signal, signal, final]),
+                    patch("bot.ImageGrab.grab", side_effect=[blank, blank, signal, final]),
                     patch("bot.list_monitors", return_value=app.monitors),
                     patch("bot.ImageTk.PhotoImage"),
                     patch("bot.time.time", return_value=1_800_000_002),
@@ -274,7 +315,7 @@ class LiveReferenceTests(unittest.TestCase):
                     patch("bot.messagebox.showerror") as error,
                     patch("config.EMA_ENTRY_FILTER_ENABLED", False),
                 ):
-                    for _ in range(4):
+                    for _ in range(2):
                         app.tick()
                         app.execution.submit.assert_not_called()
                     app.tick()
@@ -287,7 +328,63 @@ class LiveReferenceTests(unittest.TestCase):
                     self.assertEqual(app.ema_result.market_state, "UNKNOWN")
                 write.assert_called_once()
                 error.assert_not_called()
-                self.assertEqual(app.root.after.call_count, 5)
+                self.assertEqual(app.root.after.call_count, 3)
+
+    def test_first_frame_arrow_disappearing_in_final_capture_never_submits(self):
+        app = self.app()
+        blank = self.ema_chart("BULLISH")
+        arrow = self.ema_chart("BULLISH", "CALL")
+        with (
+            patch("config.EMA_ENTRY_FILTER_ENABLED", False),
+            patch("bot.ImageGrab.grab", side_effect=[blank, blank, arrow, blank]),
+            patch("bot.list_monitors", return_value=app.monitors),
+            patch("bot.ImageTk.PhotoImage"),
+            patch("bot.time.time", return_value=1_800_000_002),
+            patch("bot.time.monotonic", side_effect=itertools.count(10, .001)),
+            patch("bot.write_event"),
+        ):
+            for _ in range(3):
+                app.tick()
+        app.execution.submit.assert_not_called()
+        self.assertTrue(app.execution.armed)
+        self.assertFalse(app.gate.armed)
+        self.assertIn("antes del clic", app.status.set.call_args.args[0])
+
+    def test_fragmented_arrow_uses_first_frame_and_final_capture_safety(self):
+        for direction in ("CALL", "PUT"):
+            for final_present in (True, False):
+                with self.subTest(direction=direction, final_present=final_present):
+                    app = self.app()
+                    blank = self.ema_chart("UNKNOWN")
+                    arrow = self.ema_chart("UNKNOWN", direction)
+                    ImageDraw.Draw(arrow).rectangle(
+                        (346, 190, 348, 213), fill="#df5050",
+                    )
+                    final = arrow if final_present else blank
+                    with (
+                        patch("config.EMA_ENTRY_FILTER_ENABLED", False),
+                        patch("bot.ImageGrab.grab", side_effect=[blank, blank, arrow, final]),
+                        patch("bot.list_monitors", return_value=app.monitors),
+                        patch("bot.ImageTk.PhotoImage"),
+                        patch("bot.time.time", return_value=1_800_000_002),
+                        patch("bot.time.monotonic", side_effect=itertools.count(10, .001)),
+                        patch("bot.write_event") as write,
+                        patch("bot.messagebox.showerror") as error,
+                    ):
+                        for _ in range(2):
+                            app.tick()
+                            app.execution.submit.assert_not_called()
+                        app.tick()
+                    if final_present:
+                        app.execution.submit.assert_called_once_with(
+                            direction, 1_800_000_002, 300,
+                        )
+                    else:
+                        app.execution.submit.assert_not_called()
+                        self.assertFalse(app.gate.armed)
+                    write.assert_called_once()
+                    error.assert_not_called()
+                    self.assertTrue(app.execution.armed)
 
     def test_missing_reference_continues_scanning_without_signal_or_click(self):
         app = self.app()
@@ -312,6 +409,26 @@ class LiveReferenceTests(unittest.TestCase):
 
 
 class RealLiveTests(unittest.TestCase):
+    def test_shared_fragmented_arrow_is_reconstructed_but_keeps_24_pixel_minimum(self):
+        path = os.environ.get("IQ_OPTION_FRAGMENT_IMAGE")
+        if not path:
+            self.skipTest("Especifica la captura real de flecha fragmentada.")
+        image = Image.open(path).convert("RGB")
+        sample = Image.new("RGB", (60, 60), "#101827")
+        ImageDraw.Draw(sample).polygon(
+            [(21, 5), (10, 31), (32, 31)], fill=ARROW_COLORS["CALL"],
+        )
+        template = template_from(sample, "CALL")
+        reconstructed = [
+            shape for shape in arrow_shapes(image, "CALL", template)
+            if shape.origin == (128, 259)
+        ]
+        self.assertEqual([(shape.width, shape.height) for shape in reconstructed], [(23, 23)])
+        diagnostics = []
+        self.assertIsNone(detect(image, {"CALL": template}, (136, 143), diagnostics))
+        self.assertIn("figura 23x23", diagnostics[0])
+        self.assertIn("minimo 17x24", diagnostics[0])
+
     def test_both_shared_captures_with_calibrated_colors_and_full_crop_roi(self):
         paths = [os.environ.get("IQ_OPTION_REFERENCE_IMAGE"), os.environ.get("IQ_OPTION_OPENING_IMAGE")]
         if not all(paths):

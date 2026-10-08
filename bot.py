@@ -62,6 +62,9 @@ COLORS: dict[Signal, tuple[int, int, int]] = {
 }
 COLOR_TOLERANCE = 24
 MIN_SCORE = 0.70
+MIN_ARROW_WIDTH = 17
+MIN_ARROW_HEIGHT = 24
+MAX_ARROW_FRAGMENT_GAP = 3
 CAPTURE_INTERVAL_MS = 100
 CSV_FIELDS = (
     "observed_at_utc", "asset_declared", "timeframe_seconds",
@@ -159,21 +162,23 @@ def template_from(image: Image.Image, signal: Signal) -> Shape:
     return shapes[0]
 
 
+def arrow_size_allowed(actual: Shape, expected: Shape) -> bool:
+    return (
+        MIN_ARROW_WIDTH <= actual.width <= expected.width + 1
+        and MIN_ARROW_HEIGHT <= actual.height <= expected.height + 2
+    )
+
+
 def similarity(actual: Shape, expected: Shape) -> float:
-    if (
-        abs(actual.height - expected.height) > 2
-        or actual.width > expected.width + 1
-        or (actual.width < 10 and abs(actual.width - expected.width) > 1)
-    ):
+    if not arrow_size_allowed(actual, expected):
         return 0.0
-    if actual.width < expected.width - 1:
-        # Normalize only horizontal compression; height and color stay fixed.
+    if actual.width < expected.width - 1 or actual.height < expected.height - 2:
         mask = Image.new("L", (expected.width, expected.height))
         for point in expected.pixels:
             mask.putpixel(point, 255)
-        mask = mask.resize((actual.width, expected.height), Image.Resampling.NEAREST)
+        mask = mask.resize((actual.width, actual.height), Image.Resampling.NEAREST)
         expected = Shape(
-            actual.width, expected.height,
+            actual.width, actual.height,
             frozenset(
                 (i % mask.width, i // mask.width)
                 for i, value in enumerate(mask.tobytes()) if value
@@ -187,6 +192,69 @@ def similarity(actual: Shape, expected: Shape) -> float:
     )
 
 
+def arrow_shapes(image: Image.Image, signal: Signal, template: Shape) -> list[Shape]:
+    """Agrupar cortes de hasta tres pixeles sin rellenar la silueta visible."""
+    fragments = components(
+        image, signal, min_pixels=3, min_width=1, min_height=1,
+    )
+    shapes = [
+        fragment for fragment in fragments
+        if len(fragment.pixels) >= 12 and fragment.width >= 4 and fragment.height >= 4
+    ]
+    candidates = [
+        fragment for fragment in fragments
+        if fragment.width <= template.width + 1
+        and fragment.height <= template.height + 2
+        and similarity(fragment, template) < MIN_SCORE
+    ]
+    owners: dict[Point, int] = {}
+    for index, fragment in enumerate(candidates):
+        left, top = fragment.origin
+        for x, y in fragment.pixels:
+            owners[(left + x, top + y)] = index
+    neighbors: list[set[int]] = [set() for _ in candidates]
+    for (x, y), index in owners.items():
+        for distance in range(2, MAX_ARROW_FRAGMENT_GAP + 2):
+            for point in ((x + distance, y), (x, y + distance)):
+                other = owners.get(point)
+                if other is not None and other != index:
+                    neighbors[index].add(other)
+                    neighbors[other].add(index)
+    visited: set[int] = set()
+    for index in range(len(candidates)):
+        if index in visited:
+            continue
+        group = {index}
+        pending = [index]
+        visited.add(index)
+        while pending:
+            for other in neighbors[pending.pop()]:
+                if other not in visited:
+                    visited.add(other)
+                    group.add(other)
+                    pending.append(other)
+        if len(group) < 2:
+            continue
+        pixels = {
+            (fragment.origin[0] + x, fragment.origin[1] + y)
+            for member in group
+            for fragment in (candidates[member],)
+            for x, y in fragment.pixels
+        }
+        left = min(x for x, _ in pixels)
+        top = min(y for _, y in pixels)
+        width = max(x for x, _ in pixels) - left + 1
+        height = max(y for _, y in pixels) - top + 1
+        if width > template.width + 1 or height > template.height + 2:
+            continue
+        shapes.append(Shape(
+            width, height,
+            frozenset((x - left, y - top) for x, y in pixels),
+            (left, top),
+        ))
+    return shapes
+
+
 def detect(
     image: Image.Image, templates: dict[Signal, Shape],
     center_range: tuple[float, float] | None = None,
@@ -195,7 +263,7 @@ def detect(
     matches: list[Detection] = []
     for signal, template in templates.items():
         shapes = [
-            shape for shape in components(image, signal)
+            shape for shape in arrow_shapes(image, signal, template)
             if center_range is None
             or center_range[0] < shape.origin[0] + (shape.width - 1) / 2 < center_range[1]
         ]
@@ -206,14 +274,11 @@ def detect(
                 similarity(shape, template),
                 -abs(shape.width - template.width) - abs(shape.height - template.height),
             ))
-            if (
-                abs(best.height - template.height) > 2
-                or best.width > template.width + 1
-                or (best.width < 10 and abs(best.width - template.width) > 1)
-            ):
+            if not arrow_size_allowed(best, template):
                 diagnostics.append(
                     f"{signal}: figura {best.width}x{best.height}, muestra "
-                    f"{template.width}x{template.height}. Tamano distinto; recalibra."
+                    f"{template.width}x{template.height}. Tamano fuera de rango "
+                    f"(minimo {MIN_ARROW_WIDTH}x{MIN_ARROW_HEIGHT}); recalibra."
                 )
             else:
                 diagnostics.append(
@@ -419,7 +484,7 @@ def _track_mask(mask: Image.Image, anchor: float | None = None) -> tuple[float, 
 
 
 class SignalGate:
-    """Rearmar tras ausencia y exigir tres capturas; maximo un evento/intervalo."""
+    """Rearmar tras dos ausencias y aceptar una captura; un evento/intervalo."""
 
     def __init__(self, period: int) -> None:
         if period <= 0:
@@ -462,7 +527,7 @@ class SignalGate:
         else:
             self.candidate = detection.signal
             self.consecutive = 1
-        if self.consecutive >= 3:
+        if self.consecutive >= 1:
             self.emitted = True
             return True
         return False
@@ -1029,7 +1094,7 @@ class App:
                 detection,
                 detection is not None
                 and detection.signal == self.gate.candidate
-                and self.gate.consecutive >= 3,
+                and self.gate.consecutive >= 1,
             )
             if detection is None and diagnostics:
                 self.signal_text.set("FIGURA DETECTADA / SENAL NO VALIDADA")
@@ -1096,7 +1161,7 @@ class App:
                 if detection is not None:
                     self.status.set(
                         f"{detection.signal} reconocida; validando "
-                        f"{self.gate.consecutive}/3 capturas consecutivas."
+                        f"{self.gate.consecutive}/1 captura valida."
                     )
                 else:
                     self.status.set("Linea roja, vela y punto confirmados. Sin compras.")
@@ -1105,7 +1170,7 @@ class App:
                     "ya registrada en este intervalo" if self.gate.emitted else
                     "espera ausencia previa; no habilitada como senal nueva"
                     if not self.gate.armed else
-                    f"validando {self.gate.consecutive}/3 capturas"
+                    f"validando {self.gate.consecutive}/1 captura"
                 )
                 report = f"{detection.signal} reconocida: {reason}"
             else:

@@ -129,19 +129,24 @@ superior sin el icono inferior.
 [ema_analyzer.py](ema_analyzer.py) reconoce las curvas que ya dibuja la
 plataforma: EMA 9 cian/azul y EMA 21 amarillo/naranja. No calcula medias
 desde precios ni genera ordenes por si solo. Tras verificarlo en tiempo real,
-se habilito como filtro de las flechas existentes:
+se implemento un filtro opcional de las flechas existentes. Actualmente esta
+**desactivado** (`EMA_ENTRY_FILTER_ENABLED = False`): las EMA se muestran
+solo como informacion y nunca bloquean ni autorizan entradas, incluso en
+SIDEWAYS, CROSSING, UNKNOWN, baja confianza o perdida de deteccion.
+Se mantienen todos los requisitos de flecha, vela, punto, linea y cuenta DEMO.
+Las reglas siguientes solo aplican si se habilita explicitamente el filtro:
 
 - CALL requiere EMA `BULLISH` con confianza >= `EMA_MIN_CONFIDENCE`.
 - PUT requiere EMA `BEARISH` con esa misma confianza minima.
 - `CROSSING`, `SIDEWAYS`, `UNKNOWN`, errores, ausencia o datos desactualizados
   bloquean entradas. No se opera exclusivamente por cruces EMA.
 
-Se conservan tres capturas consecutivas de flecha, rearme por dos ausencias,
+Se acepta una sola captura valida de flecha, con rearme por dos ausencias,
 referencia de vela/punto/linea, una senal por intervalo y protecciones DEMO.
 Cada captura que cuenta para validar la flecha debe superar el filtro EMA;
 un bloqueo reinicia ese conteo, pero NO cuenta como ausencia para rearmar.
-Si las EMA se recuperan y la flecha sigue presente, debe cumplir otras tres
-capturas compatibles, siempre que ya hubiera rearme valido.
+Si las EMA se recuperan y la flecha sigue presente, basta una captura
+compatible, siempre que ya hubiera rearme valido.
 Antes de `submit` se toma una captura nueva y se revalidan referencia,
 flecha y EMA. Si el filtro falla entonces, no se envia solicitud y no se
 reintenta esa senal en el mismo intervalo. El detector y DEMO siguen activos.
@@ -218,7 +223,7 @@ Los ajustes documentados estan en [config.py](config.py):
 | `EMA_MAX_FRAME_GAP_SECONDS` | 1 | Reinicia seguimiento tras discontinuidad temporal |
 | `EMA_CROSS_CONFIRMATION_FRAMES` | 3 | Frames para establecer cada lado del cruce |
 | `EMA_MIN_CONFIDENCE` | 75 | Minimo 0..100; por debajo, UNKNOWN |
-| `EMA_ENTRY_FILTER_ENABLED` | True | Exige BULLISH para CALL o BEARISH para PUT |
+| `EMA_ENTRY_FILTER_ENABLED` | False | Opcional: True exige BULLISH para CALL o BEARISH para PUT |
 | `EMA_CONFIDENCE_WEIGHTS` | .20,.25,.20,.15,.20 | Color, continuidad, puntos, temporal, relacion |
 
 Estos son umbrales visuales iniciales para la captura proporcionada, no
@@ -342,7 +347,7 @@ Un cuerpo de menos de tres filas coloreadas aun no se confirma: no se
 autoriza una entrada sobre una vela apenas visible o sin cuerpo medible.
 Una flecha CALL/PUT nueva dentro de la franja actual puede habilitar una
 entrada aunque el cuerpo de la vela este quieto. Se mantienen dos capturas
-sin flecha para rearmar, tres capturas consecutivas de reconocimiento y
+sin flecha para rearmar, una captura valida de reconocimiento y
 como maximo una senal por intervalo. Las flechas presentes al iniciar y
 las centradas fuera de la referencia no habilitan entradas. Un desplazamiento
 de la vela mayor de 3 pixeles reinicia el rearme; antes de solicitar la orden
@@ -350,7 +355,7 @@ se toma otra captura y se exige de nuevo linea, vela, punto, coincidencia
 y confianza, con centro de vela a no mas de 2 pixeles del anterior y la misma
 direccion de flecha. No exige la misma coordenada Y del punto: puede moverse
 con el precio. Ante perdida de referencia siempre se vuelve a exigir dos
-capturas validas sin flecha y tres reconocimientos consecutivos.
+capturas validas sin flecha y un reconocimiento valido.
 Se conserva el contador Intentos y la continuidad al vencer el tiempo de
 entrada; no se convierten fallos visuales en intentos por tiempo.
 La comprobacion es visual, no prueba la hora de la vela ni garantiza ausencia
@@ -449,21 +454,40 @@ motivo y vuelve a intentar leer el resultado automaticamente, sin repetir
 el clic de compra/venta ni reactivar las entradas por si solo. Las operaciones
 historicas nunca generan senales.
 
-El reconocimiento admite variaciones de borde de hasta un pixel de ancho
-y dos de alto. Tambien acepta compresion horizontal desde 10 pixeles de
-ancho hasta el ancho calibrado: ajusta solo el ancho de la silueta de
-referencia y exige coincidencia >=70 %. Con una muestra de 23x27 puede
-validar 10x27 o 16x27, pero no acepta una figura por dimensiones solamente.
-Mantiene color, altura y comparacion de forma; las figuras por debajo del
-70 % siguen rechazadas, pero algunas flechas recortadas pueden superar
-este umbral. No amplia la tolerancia al zoom vertical. Una figura rechazada del color esperado
+El minimo para reconocer CALL y PUT es **17x24 pixeles**, inclusive:
+ancho >=17 y alto >=24 de la silueta coloreada visible, no del recuadro seleccionado.
+Por debajo de cualquiera de esos limites la figura se rechaza.
+Se permite reducir la silueta calibrada en ancho y alto hasta ese minimo,
+conservando la comparacion de forma y color y la coincidencia >=70%.
+Por ejemplo, una muestra de 23x27 puede reconocer 17x24, 19x24 o 20x24;
+las dimensiones por si solas nunca autorizan una entrada.
+Se conservan los limites superiores de muestra +1px de ancho y +2px de alto:
+un aumento mayor de zoom requiere recalibrar.
+Si una linea superpuesta divide la flecha, se agrupan fragmentos del mismo
+color separados por hasta 3 pixeles faltantes en horizontal o vertical
+(`MAX_ARROW_FRAGMENT_GAP` en `bot.py`). Se incluyen piezas estrechas de al menos
+3 pixeles coloreados y se verifica el centro del conjunto en la franja actual.
+El conjunto no puede exceder los limites de la muestra y debe conservar
+una coincidencia >=70%. No se rellenan huecos ni se inventan extremos:
+una silueta visible de 23x23 sigue siendo rechazada por altura insuficiente.
+Se usa la misma reconstruccion en la captura inicial y en la captura final.
+Las flechas completas siguen reconociendose sin agruparse con ruido cercano;
+varias flechas reconocidas siguen bloqueando por ambiguedad. Cortes mayores,
+perdida excesiva de color o grupos con forma incompatible se rechazan.
+Algunas flechas recortadas pueden superar el umbral de forma si aun cumplen
+el minimo; este filtro no garantiza ausencia de falsos positivos.
+Una figura rechazada del color esperado
 no cuenta como captura sin flecha para rearmar: evita habilitar como nueva
-una flecha que solo alterna entre reconocida y rechazada. Se mantienen tres
-capturas consecutivas y el bloqueo de flechas ya visibles al cambiar de vela.
+una flecha que solo alterna entre reconocida y rechazada. Se acepta una
+captura valida y se mantiene el bloqueo de flechas ya visibles al cambiar de vela.
 El umbral del 70 % permite mayor variacion de forma, pero aumenta el riesgo
 de aceptar figuras que no sean flechas respecto al umbral anterior del 88 %.
-Las tres capturas usan ahora pausas de 100 ms: al menos 200 ms entre la
-primera y la tercera, mas el procesamiento. Las mascaras de flechas se
+Las capturas usan pausas de 100 ms, mas el procesamiento. Tras el rearme,
+la primera flecha reconocida habilita la comprobacion final, sin esperar
+otras dos capturas de validacion. Se conserva la captura final de seguridad
+antes de solicitar la orden. Esto admite senales fugaces que antes no
+completaban tres capturas y aumenta el riesgo de entradas por repintado.
+Las mascaras de flechas se
 calculan con Pillow; OpenCV detecta linea, vela y punto para validar la referencia.
 La preparacion reutiliza la configuracion recien leida por submit; si se
 cambia Tiempo, vuelve a leerla despues del ajuste. Si Tiempo ya coincide
@@ -497,7 +521,10 @@ python -m unittest -q test_live_candle_reference test_expiration_line test_candl
 ```
 
 Las regresiones cubren cuerpos diminutos, franjas de seguimiento,
-reconocimiento de flechas sobre velas quietas y protecciones DEMO.
+reconocimiento de flechas sobre velas quietas, flechas fragmentadas CALL/PUT,
+rechazo de texto/rectangulos/mechas y protecciones DEMO. La regresion opcional
+`IQ_OPTION_FRAGMENT_IMAGE` usa el recorte compartido de 315x401: verifica
+que sus fragmentos formen 23x23 sin autorizar una entrada bajo el minimo.
 
 ## Limites y privacidad
 

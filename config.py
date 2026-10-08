@@ -1,7 +1,7 @@
 """Visual EMA defaults; distances are screenshot pixels, not price units."""
 
 EMA_ANALYSIS_ENABLED = True
-EMA_ENTRY_FILTER_ENABLED = True
+EMA_ENTRY_FILTER_ENABLED = False
 DEBUG_MODE = True
 EMA_FAST_PERIOD = 9
 EMA_SLOW_PERIOD = 21

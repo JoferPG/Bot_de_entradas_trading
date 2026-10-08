@@ -21,7 +21,7 @@ def arrow_image(signal="CALL", position=(10, 10)):
     image = Image.new("RGB", (90, 80), "#101827")
     x, y = position
     ImageDraw.Draw(image).polygon(
-        [(x + 8, y), (x, y + 16), (x + 16, y + 16)], fill=COLORS[signal],
+        [(x + 8, y), (x, y + 23), (x + 16, y + 23)], fill=COLORS[signal],
     )
     return image
 
@@ -246,10 +246,10 @@ class TrackingTests(unittest.TestCase):
         draw = ImageDraw.Draw(image)
         for center in centers:
             draw.rectangle((center - 6, 70, center + 6, 110), fill=self.colors[0])
-        historical = arrow_image("PUT").crop((10, 10, 27, 27))
+        historical = arrow_image("PUT").crop((10, 10, 27, 34))
         image.paste(historical, (centers[0] - 8, 25))
         if current_signal:
-            arrow = arrow_image(current_signal).crop((10, 10, 27, 27))
+            arrow = arrow_image(current_signal).crop((10, 10, 27, 34))
             image.paste(arrow, (centers[-1] - 8, 135))
         draw.line((0, 90, 249, 90), fill="#F0B414")
         draw.ellipse(
@@ -264,7 +264,7 @@ class TrackingTests(unittest.TestCase):
             self.assertEqual(band, (107, 113))
             self.assertEqual(detect(image, self.templates, band).signal, direction)
             historical = self.chart([30, 70, 110])
-            historical.paste(arrow_image(direction).crop((10, 10, 27, 27)), (62, 135))
+            historical.paste(arrow_image(direction).crop((10, 10, 27, 34)), (62, 135))
             self.assertIsNone(detect(
                 historical, self.templates, current_candle_reference(historical, self.colors),
             ))
@@ -347,7 +347,7 @@ class TrackingTests(unittest.TestCase):
         draw.ellipse((493, 157, 499, 163), fill="white")
         band = current_candle_reference(image, self.colors)
         self.assertEqual(band, (493, 499))
-        image.paste(arrow_image("PUT").crop((10, 10, 27, 27)), (442, 65))
+        image.paste(arrow_image("PUT").crop((10, 10, 27, 34)), (442, 65))
         self.assertIsNone(detect(image, self.templates, band))
 
     def test_gray_current_candle_does_not_select_previous_put(self):
@@ -356,7 +356,7 @@ class TrackingTests(unittest.TestCase):
         draw.rectangle((144, 70, 156, 110), fill="#777777")
         draw.line((0, 90, 249, 90), fill="#F0B414")
         draw.ellipse((147, 87, 153, 93), fill="white")
-        image.paste(arrow_image("PUT").crop((10, 10, 27, 27)), (102, 135))
+        image.paste(arrow_image("PUT").crop((10, 10, 27, 34)), (102, 135))
         with self.assertRaises(TrackingUnavailable):
             current_candle_reference(image, self.colors)
 
@@ -543,7 +543,7 @@ class TrackingTests(unittest.TestCase):
         app.preview_panel.configure.assert_called_once_with(image=photo.return_value)
         app.execution.submit.assert_not_called()
 
-    def test_brief_tracking_loss_disarms_and_restarts_three_frame_count(self):
+    def test_brief_tracking_loss_disarms_and_requires_absence_again(self):
         app = App.__new__(App)
         app.gate = SignalGate(300)
         timestamp = 1800000002.0
@@ -613,8 +613,6 @@ class TrackingTests(unittest.TestCase):
         app.gate = SignalGate(300)
         for timestamp, detection in (
             (1800000000, None), (1800000000.5, None),
-            (1800000001, Detection("CALL", 1)),
-            (1800000001.5, Detection("CALL", 1)),
         ):
             app.gate.observe(timestamp, detection)
         app.region = (0, 0, 250, 200)
@@ -855,63 +853,156 @@ class VisualTests(unittest.TestCase):
             for signal in ("CALL", "PUT")
         }
 
+    def test_fragmented_arrows_preserve_visible_size_and_score(self):
+        for signal in ("CALL", "PUT"):
+            for slit in ((14, 10, 16, 33), (10, 21, 26, 23)):
+                with self.subTest(signal=signal, slit=slit):
+                    image = arrow_image(signal)
+                    ImageDraw.Draw(image).rectangle(slit, fill="#df5050")
+                    result = detect(image, self.templates, center_range=(17, 19))
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result.signal, signal)
+                    self.assertGreaterEqual(result.score, .70)
+                    self.assertLess(result.score, 1.)
+                    self.assertIsNone(detect(image, self.templates, center_range=(20, 25)))
+
+    def test_fragmented_arrow_can_include_narrow_middle_piece(self):
+        for signal in ("CALL", "PUT"):
+            image = arrow_image(signal)
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((16, 10, 16, 33), fill="#df5050")
+            draw.rectangle((20, 10, 20, 33), fill="#df5050")
+            result = detect(image, self.templates)
+            self.assertIsNotNone(result)
+            self.assertEqual(result.signal, signal)
+
+    def test_fragment_reconstruction_does_not_invent_size_or_missing_pixels(self):
+        for signal in ("CALL", "PUT"):
+            for width, height in ((16, 24), (17, 23), (17, 24)):
+                with self.subTest(signal=signal, width=width, height=height):
+                    image = Image.new("RGB", (90, 80), "#101827")
+                    draw = ImageDraw.Draw(image)
+                    draw.polygon(
+                        [(10+(width-1)//2, 10), (10, 10+height-1),
+                         (10+width-1, 10+height-1)], fill=COLORS[signal],
+                    )
+                    # Five missing columns exceed both the gap and shape limits.
+                    draw.rectangle((16, 10, 20, 33), fill="#df5050")
+                    self.assertIsNone(detect(image, self.templates))
+
+    def test_reconstructed_short_or_narrow_arrow_still_reports_size_rejection(self):
+        for width, height in ((16, 24), (17, 23)):
+            image = Image.new("RGB", (90, 80), "#101827")
+            draw = ImageDraw.Draw(image)
+            draw.polygon(
+                [(10+(width-1)//2, 10), (10, 10+height-1),
+                 (10+width-1, 10+height-1)], fill=COLORS["CALL"],
+            )
+            draw.line((14, 10, 14, 33), fill="#df5050")
+            diagnostics = []
+            self.assertIsNone(detect(image, self.templates, diagnostics=diagnostics))
+            self.assertIn(f"{width}x{height}", diagnostics[0])
+            self.assertIn("Tamano fuera de rango", diagnostics[0])
+
+    def test_four_pixel_gap_is_not_bridged_even_if_shape_score_would_pass(self):
+        image = arrow_image()
+        ImageDraw.Draw(image).rectangle((12, 10, 15, 33), fill="#df5050")
+        self.assertIsNone(detect(image, self.templates))
+
+    def test_complete_arrow_near_small_noise_is_not_counted_twice(self):
+        image = arrow_image()
+        ImageDraw.Draw(image).rectangle((28, 29, 29, 33), fill=COLORS["CALL"])
+        self.assertEqual(detect(image, self.templates).signal, "CALL")
+
+    def test_fragmented_same_color_text_rectangles_and_wicks_are_rejected(self):
+        for signal in ("CALL", "PUT"):
+            for kind in ("text", "rectangle", "wicks"):
+                with self.subTest(signal=signal, kind=kind):
+                    image = Image.new("RGB", (90, 80), "#101827")
+                    draw = ImageDraw.Draw(image)
+                    if kind == "text":
+                        draw.text(
+                            (10, 10), signal, font=ImageFont.load_default(size=24),
+                            fill=COLORS[signal],
+                        )
+                    elif kind == "rectangle":
+                        draw.rectangle((10, 10, 26, 33), fill=COLORS[signal])
+                        draw.rectangle((17, 10, 19, 33), fill="#df5050")
+                    else:
+                        for x in (10, 14, 18, 22, 26):
+                            draw.line((x, 10, x, 33), fill=COLORS[signal])
+                    self.assertIsNone(detect(image, self.templates))
+
+    def test_two_fragmented_arrows_remain_ambiguous(self):
+        image = arrow_image()
+        ImageDraw.Draw(image).rectangle((14, 10, 16, 33), fill="#df5050")
+        image.paste(image.crop((10, 10, 27, 34)), (50, 40))
+        with self.assertRaisesRegex(RuntimeError, "Varias"):
+            detect(image, self.templates)
+
+    def test_opposite_fragmented_arrows_remain_ambiguous(self):
+        image = arrow_image()
+        put = arrow_image("PUT")
+        ImageDraw.Draw(image).rectangle((14, 10, 16, 33), fill="#df5050")
+        ImageDraw.Draw(put).rectangle((14, 10, 16, 33), fill="#df5050")
+        image.paste(put.crop((10, 10, 27, 34)), (50, 40))
+        with self.assertRaisesRegex(RuntimeError, "simultaneos"):
+            detect(image, self.templates)
+
     def test_diagnostic_explains_size_mismatch_without_accepting(self):
         image = Image.new("RGB", (90, 80), "#101827")
         ImageDraw.Draw(image).polygon([(20, 10), (10, 30), (30, 30)], fill=COLORS["CALL"])
         diagnostics = []
         self.assertIsNone(detect(image, self.templates, diagnostics=diagnostics))
         self.assertIn("21x21", diagnostics[0])
-        self.assertIn("17x17", diagnostics[0])
-        self.assertIn("Tamano distinto", diagnostics[0])
+        self.assertIn("17x24", diagnostics[0])
+        self.assertIn("Tamano fuera de rango", diagnostics[0])
 
     def test_minor_raster_edge_loss_remains_same_arrow(self):
-        image = arrow_image()
+        image = Image.new("RGB", (90, 80), "#101827")
+        ImageDraw.Draw(image).polygon([(19, 10), (10, 36), (28, 36)], fill=COLORS["CALL"])
+        templates = {"CALL": template_from(image, "CALL")}
         for width_loss, height_loss in ((1, 0), (0, 1), (1, 2)):
             actual = image.copy()
             draw = ImageDraw.Draw(actual)
             if width_loss:
-                draw.line((26, 10, 26, 26), fill="#101827")
+                draw.line((28, 10, 28, 36), fill="#101827")
             if height_loss:
-                draw.rectangle((10, 10, 26, 9+height_loss), fill="#101827")
-            result = detect(actual, self.templates)
+                draw.rectangle((10, 10, 28, 9+height_loss), fill="#101827")
+            result = detect(actual, templates)
             self.assertIsNotNone(result)
             self.assertEqual(result.signal, "CALL")
 
-    def test_narrow_10_and_16_by_27_arrows_keep_shape_validation(self):
+    def test_arrows_from_17_by_24_keep_shape_validation(self):
         for signal in ("CALL", "PUT"):
             sample = Image.new("RGB", (60, 60), "#101827")
             ImageDraw.Draw(sample).polygon(
                 [(21, 5), (10, 31), (32, 31)], fill=COLORS[signal],
             )
             template = template_from(sample, signal)
-            for width in (10, 16, 22, 23):
-                with self.subTest(signal=signal, width=width):
+            for width, height in ((17, 24), (19, 24), (20, 24), (22, 27), (23, 27)):
+                with self.subTest(signal=signal, width=width, height=height):
                     image = Image.new("RGB", (60, 60), "#101827")
-                    image.paste(
-                        sample.crop((10, 5, 33, 32)).resize(
-                            (width, 27), Image.Resampling.NEAREST,
-                        ), (10, 5),
+                    ImageDraw.Draw(image).polygon(
+                        [(10+(width-1)//2, 5), (10, 5+height-1),
+                         (10+width-1, 5+height-1)], fill=COLORS[signal],
                     )
                     result = detect(image, {signal: template})
                     self.assertIsNotNone(result)
                     self.assertEqual(result.signal, signal)
-                    self.assertGreaterEqual(result.score, 0.88)
-            for width, height in ((9, 27), (10, 24), (25, 27)):
+                    self.assertGreaterEqual(result.score, 0.70)
+            for width, height in ((16, 24), (17, 23), (10, 24), (25, 27)):
                 image = Image.new("RGB", (60, 60), "#101827")
                 image.paste(
-                    sample.crop((10, 5, 33, 32)).resize((width, height)), (10, 5),
+                    sample.crop((10, 5, 33, 32)).resize((width, height), Image.Resampling.NEAREST), (10, 5),
                 )
                 self.assertIsNone(detect(image, {signal: template}))
             rectangle = Image.new("RGB", (60, 60), "#101827")
-            ImageDraw.Draw(rectangle).rectangle((10, 5, 19, 31), fill=COLORS[signal])
+            ImageDraw.Draw(rectangle).rectangle((10, 5, 26, 28), fill=COLORS[signal])
             self.assertIsNone(detect(rectangle, {signal: template}))
             clipped = Image.new("RGB", (60, 60), "#101827")
             clipped.paste(sample.crop((17, 5, 33, 32)), (10, 5))
-            result = detect(clipped, {signal: template})
-            self.assertIsNotNone(result)
-            self.assertEqual(result.signal, signal)
-            self.assertGreaterEqual(result.score, 0.70)
-            self.assertLess(result.score, 0.88)
+            self.assertIsNone(detect(clipped, {signal: template}))
 
     def test_visible_arrow_cannot_revalidate_at_next_candle(self):
         gate = SignalGate(60)
@@ -928,7 +1019,7 @@ class VisualTests(unittest.TestCase):
 
     def test_diagnostic_explains_shape_mismatch_without_accepting(self):
         image = Image.new("RGB", (90, 80), "#101827")
-        ImageDraw.Draw(image).rectangle((10, 10, 26, 26), fill=COLORS["CALL"])
+        ImageDraw.Draw(image).rectangle((10, 10, 26, 33), fill=COLORS["CALL"])
         diagnostics = []
         self.assertIsNone(detect(image, self.templates, diagnostics=diagnostics))
         self.assertIn("requiere 70%", diagnostics[0])
@@ -974,13 +1065,13 @@ class VisualTests(unittest.TestCase):
 
     def test_ambiguous_signals_stop(self):
         image = arrow_image("CALL")
-        image.paste(arrow_image("PUT").crop((10, 10, 27, 27)), (50, 40))
+        image.paste(arrow_image("PUT").crop((10, 10, 27, 34)), (50, 40))
         with self.assertRaisesRegex(RuntimeError, "simultaneos"):
             detect(image, self.templates)
 
     def test_multiple_same_direction_stop(self):
         image = arrow_image()
-        image.paste(arrow_image().crop((10, 10, 27, 27)), (50, 40))
+        image.paste(arrow_image().crop((10, 10, 27, 34)), (50, 40))
         with self.assertRaisesRegex(RuntimeError, "Varias"):
             detect(image, self.templates)
 
@@ -1002,7 +1093,7 @@ class VisualTests(unittest.TestCase):
 
     def test_sample_with_two_arrows_rejected(self):
         image = arrow_image()
-        image.paste(arrow_image().crop((10, 10, 27, 27)), (50, 40))
+        image.paste(arrow_image().crop((10, 10, 27, 34)), (50, 40))
         with self.assertRaisesRegex(ValueError, "varias figuras"):
             template_from(image, "CALL")
 
@@ -1012,18 +1103,30 @@ class VisualTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_one_absence_is_not_enough_but_two_enable_first_frame(self):
+        for direction in ("CALL", "PUT"):
+            with self.subTest(direction=direction):
+                gate = SignalGate(300)
+                gate.observe(1, None)
+                self.assertFalse(gate.observe(2, Detection(direction, 1)))
+                gate.observe(3, None)
+                gate.observe(4, None)
+                self.assertTrue(gate.observe(5, Detection(direction, 1)))
+                self.assertEqual(gate.consecutive, 1)
+                self.assertFalse(gate.observe(6, Detection(direction, 1)))
+
     def test_existing_signal_never_logged_on_start(self):
         gate = SignalGate(300)
         for timestamp in range(10, 20):
             self.assertFalse(gate.observe(timestamp, Detection("CALL", 1.0)))
 
-    def test_debounce_and_one_event_per_interval(self):
+    def test_first_valid_frame_and_one_event_per_interval(self):
         gate = SignalGate(300)
         self.assertFalse(gate.observe(1, None))
         self.assertFalse(gate.observe(2, None))
-        self.assertFalse(gate.observe(3, Detection("CALL", 1)))
+        self.assertTrue(gate.observe(3, Detection("CALL", 1)))
         self.assertFalse(gate.observe(4, Detection("CALL", 1)))
-        self.assertTrue(gate.observe(5, Detection("CALL", 1)))
+        self.assertFalse(gate.observe(5, Detection("CALL", 1)))
         for timestamp in range(6, 10):
             self.assertFalse(gate.observe(timestamp, Detection("PUT", 1)))
 
@@ -1036,15 +1139,15 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate.observe(300, Detection("CALL", 1)))
         gate.observe(301, None)
         gate.observe(302, None)
-        self.assertFalse(gate.observe(303, Detection("PUT", 1)))
+        self.assertTrue(gate.observe(303, Detection("PUT", 1)))
         self.assertFalse(gate.observe(304, Detection("PUT", 1)))
-        self.assertTrue(gate.observe(305, Detection("PUT", 1)))
+        self.assertFalse(gate.observe(305, Detection("PUT", 1)))
 
-    def test_transient_or_changed_signal_does_not_pass(self):
+    def test_first_signal_passes_but_changed_direction_cannot_duplicate(self):
         gate = SignalGate(300)
         gate.observe(1, None)
         gate.observe(2, None)
-        self.assertFalse(gate.observe(3, Detection("CALL", 1)))
+        self.assertTrue(gate.observe(3, Detection("CALL", 1)))
         self.assertFalse(gate.observe(4, Detection("PUT", 1)))
         self.assertFalse(gate.observe(5, None))
 
