@@ -41,7 +41,9 @@ from PIL import Image, ImageChops, ImageDraw, ImageGrab, ImageTk
 from playwright.sync_api import Error as BrowserError
 
 from demo_execution import DemoBrowser, DemoExecution, EntryWindowExpired, Ledger
-from monitors import Monitor, enable_physical_coordinates, list_monitors, place_selector
+from monitors import (
+    Monitor, click_screen, enable_physical_coordinates, list_monitors, place_selector,
+)
 from live_candle_reference import LiveCandleReference, ReferenceUnavailable
 from live_ema_analysis import LiveEMAAnalysis
 from ema_analyzer import EMAResult, report as ema_report
@@ -71,6 +73,43 @@ CSV_FIELDS = (
     "inferred_interval_start_utc", "signal", "visual_score", "mode",
 )
 LOGGER = logging.getLogger("iq_option_bot")
+
+
+def chart_background_click_point(
+    image: Image.Image, region: Box,
+) -> tuple[int, int] | None:
+    """Buscar una zona vacia azul oscura dentro del grafico, lejos de velas/UI."""
+    left, top, right, bottom = region
+    if image.size != (right - left, bottom - top):
+        raise ValueError("La captura no coincide con la zona seleccionada.")
+    width, height = image.size
+    if width < 40 or height < 40:
+        return None
+    ideal_x, ideal_y = round(width * .30), round(height * .86)
+    candidates: list[tuple[int, int, int]] = []
+    for y in range(max(3, round(height * .70)), min(height - 3, round(height * .96)), 5):
+        for x in range(max(3, round(width * .12)), min(width - 3, round(width * .88)), 5):
+            patch = [
+                image.getpixel((x + dx, y + dy))[:3]
+                for dy in range(-2, 3) for dx in range(-2, 3)
+            ]
+            if all(
+                red < 48 and green < 54 and blue < 90 and blue - red >= 5
+                for red, green, blue in patch
+            ):
+                variance = sum(max(pixel) - min(pixel) for pixel in patch)
+                distance = (x - ideal_x) ** 2 + (y - ideal_y) ** 2
+                candidates.append((variance * 1000 + distance, x, y))
+    if not candidates:
+        return None
+    _, x, y = min(candidates)
+    return left + x, top + y
+
+
+def point_over_window(point: Point, window: tk.Tk) -> bool:
+    x, y = point
+    left, top = window.winfo_rootx(), window.winfo_rooty()
+    return left <= x < left + window.winfo_width() and top <= y < top + window.winfo_height()
 
 
 def configure_diagnostics(path: Path) -> RotatingFileHandler:
@@ -1246,7 +1285,29 @@ class App:
             self.root.after_cancel(self.result_job)
             self.result_job = None
         try:
-            self.execution.refresh()
+            result_recorded = self.execution.refresh()
+            overlay_status = ""
+            if result_recorded:
+                try:
+                    if self.region is None:
+                        raise RuntimeError("No hay un area de grafico seleccionada.")
+                    screenshot = ImageGrab.grab(bbox=self.region, all_screens=True)
+                    point = chart_background_click_point(screenshot, self.region)
+                    if point is None:
+                        raise RuntimeError(
+                            "No se encontro un punto de fondo seguro dentro del area del grafico."
+                        )
+                    if point_over_window(point, self.root):
+                        raise RuntimeError(
+                            "El punto seguro coincide con la ventana superior del bot; "
+                            "mueve el panel fuera del grafico."
+                        )
+                    click_screen(point)
+                    overlay_status = " Velo del grafico limpiado."
+                    LOGGER.info("Velo del grafico limpiado tras registrar el resultado.")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    overlay_status = f" No se limpio el velo: {exc}"
+                    LOGGER.warning("Resultado registrado; limpieza del velo omitida: %s", exc)
             LOGGER.info(
                 "Resultados consultados: demo_armada=%s perdidas=%s",
                 self.execution.armed, self.execution.session_losses,
@@ -1261,6 +1322,7 @@ class App:
                     if self.execution.session_losses >= 3 else
                     f"Resultados conciliados. Perdidas: {self.execution.session_losses}/3. "
                     + ("DEMO ARMADA." if self.execution.armed else "DEMO DESARMADA.")
+                    + overlay_status
                 )
         except (BrowserError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             LOGGER.exception("Lectura de resultados fallida; demo desarmada")

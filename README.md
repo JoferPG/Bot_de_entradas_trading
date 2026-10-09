@@ -453,6 +453,13 @@ el bot la crea de nuevo. Si la cierras durante la consulta, muestra el
 motivo y vuelve a intentar leer el resultado automaticamente, sin repetir
 el clic de compra/venta ni reactivar las entradas por si solo. Las operaciones
 historicas nunca generan senales.
+Despues de que la cartera registre el resultado cerrado de una operacion,
+el bot busca dentro del area seleccionada un pequeno parche uniforme del
+fondo azul oscuro del grafico y hace un clic para quitar el velo de CALL/PUT.
+No hace clic mientras la posicion siga abierta. Si el area no coincide con la
+captura o no encuentra un fondo seguro, omite el clic, muestra el motivo y
+conserva el resultado; tambien lo omite si el punto caeria debajo de la ventana
+superior del bot. El usuario puede retirar el velo manualmente.
 
 El minimo para reconocer CALL y PUT es **17x24 pixeles**, inclusive:
 ancho >=17 y alto >=24 de la silueta coloreada visible, no del recuadro seleccionado.
@@ -497,7 +504,16 @@ inicial y la comprobacion completa inmediatamente antes del clic.
 Esto reduce trabajo, pero no extiende el horario de compra que permite
 IQ Option ni sustituye un vencimiento no disponible por otro.
 El diagnostico mide por separado la lectura de configuracion, preparacion
-de vencimiento y validacion final/clic. Distingue una senal de mas de 6
+del vencimiento y comprobacion final/clic. La lectura de configuracion usa
+cuatro consultas agrupadas al DOM: cuenta/importe/vencimiento/activo,
+temporalidad y cada boton de orden. Se conservan los selectores de rol y
+nombre accesible de Playwright para no sustituirlos por coincidencias de
+texto aproximadas. Cada grupo registra su latencia; controles ausentes,
+duplicados, no interpretables o botones no disponibles bloquean la entrada.
+No hay cache de configuracion: la comprobacion completa anterior al clic
+vuelve a leer la pagina. La optimizacion no amplifica el limite de 6 segundos
+ni garantiza menos de un segundo en la plataforma real.
+Distingue una senal de mas de 6
 segundos de una vela que ya cerro. No cambia el momento en que el indicador
 genera la flecha ni limita nuevas senales a los primeros segundos de la vela.
 El limite de antiguedad es de 6 segundos al recibir la solicitud y al
@@ -525,6 +541,19 @@ reconocimiento de flechas sobre velas quietas, flechas fragmentadas CALL/PUT,
 rechazo de texto/rectangulos/mechas y protecciones DEMO. La regresion opcional
 `IQ_OPTION_FRAGMENT_IMAGE` usa el recorte compartido de 315x401: verifica
 que sus fragmentos formen 23x23 sin autorizar una entrada bajo el minimo.
+`test_settings_snapshot.py` comprueba las lecturas agrupadas y sus bloqueos.
+Para probar tambien el DOM real de Edge y medir diez lecturas locales:
+
+```powershell
+$env:IQ_OPTION_SETTINGS_BROWSER_TESTS = "1"
+python -B -m unittest test_settings_snapshot
+Remove-Item Env:IQ_OPTION_SETTINGS_BROWSER_TESTS
+```
+
+Esta prueba necesita Microsoft Edge y Playwright ya instalados. Abre un
+navegador temporal sin perfil de usuario y responde todas las peticiones con
+HTML sintetico: no conecta con IQ Option ni envia operaciones. Exige una media
+menor de un segundo en esa pagina local; no mide la latencia de la cuenta real.
 
 ## Limites y privacidad
 

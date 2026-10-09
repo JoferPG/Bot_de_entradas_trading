@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 from urllib.parse import urlparse
 
 from playwright.sync_api import (
@@ -31,6 +31,67 @@ Direction = Literal["CALL", "PUT"]
 URL = "https://iqoption.com/pwa/traderoom"
 PORTFOLIO_TIMEOUT_MS = 15000
 COLOMBIA = timezone(timedelta(hours=-5))
+
+ELEMENT_SNAPSHOT = """elements => elements.map(element => {
+    const testId = element.getAttribute('data-testid') || '';
+    const rect = element.getBoundingClientRect();
+    const visibility = getComputedStyle(element).visibility;
+    const visible = visibility !== 'hidden' && visibility !== 'collapse'
+        && rect.width > 0 && rect.height > 0;
+    const disabled = element.matches(':disabled')
+        || !!element.closest('[aria-disabled="true" i]');
+    return {
+        test_id: testId,
+        text: element.innerText,
+        container_text: testId === 'balanceAmount-Wrapper'
+            ? (element.parentElement?.parentElement?.innerText || '') : '',
+        visible,
+        enabled: !disabled
+    };
+})"""
+
+
+class ElementSnapshot(TypedDict):
+    test_id: str
+    text: str
+    container_text: str
+    visible: bool
+    enabled: bool
+
+
+def validate_snapshot(value: object) -> list[ElementSnapshot]:
+    if not isinstance(value, list):
+        raise RuntimeError("Lectura de configuracion invalida: no se recibio una lista.")
+    result: list[ElementSnapshot] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise RuntimeError("Elemento de configuracion invalido.")
+        test_id, text, container = (
+            item.get("test_id"), item.get("text"), item.get("container_text"),
+        )
+        visible, enabled = item.get("visible"), item.get("enabled")
+        if (
+            not isinstance(test_id, str) or not isinstance(text, str)
+            or not isinstance(container, str) or not isinstance(visible, bool)
+            or not isinstance(enabled, bool)
+        ):
+            raise RuntimeError("Lectura de configuracion incompleta o no interpretable.")
+        result.append({
+            "test_id": test_id, "text": text, "container_text": container,
+            "visible": visible, "enabled": enabled,
+        })
+    return result
+
+
+def validate_demo_header(headers: list[ElementSnapshot]) -> None:
+    visible = [header for header in headers if header["visible"]]
+    if len(visible) != 1:
+        raise RuntimeError("Cierra el menu de cuentas: cabecera demo ambigua.")
+    header = visible[0]
+    if "Cuenta demo" not in header["container_text"] or "Cuenta real" in header["container_text"]:
+        raise RuntimeError("No se confirma Cuenta demo en la cabecera. Orden bloqueada.")
+    if "$" not in header["text"]:
+        raise RuntimeError("Esta version de contabilidad solo admite la demo en dolares ($).")
 
 
 class EntryWindowExpired(RuntimeError):
@@ -196,6 +257,14 @@ class Ledger:
             )
         return True
 
+    def is_closed(self, identity: int) -> bool:
+        row = self.db.execute(
+            "SELECT status FROM demo_orders WHERE id=?", (identity,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Solicitud no encontrada en el registro.")
+        return row["status"] == "CLOSED"
+
     def is_closed_loss(self, identity: int) -> bool:
         row = self.db.execute(
             "SELECT status,stake,returned FROM demo_orders WHERE id=?", (identity,),
@@ -295,50 +364,71 @@ class DemoBrowser:
         parsed = urlparse(page.url)
         if parsed.scheme != "https" or parsed.hostname != "iqoption.com":
             raise RuntimeError("Dominio de IQ Option no verificado.")
-        # Cabecera visible, no el texto demo dentro del menu de cuentas.
-        header = page.get_by_test_id("balanceAmount-Wrapper").filter(visible=True)
-        if header.count() != 1:
-            raise RuntimeError("Cierra el menu de cuentas: cabecera demo ambigua.")
-        container = header.locator("xpath=../..")
-        text = container.inner_text()
-        if "Cuenta demo" not in text or "Cuenta real" in text:
-            raise RuntimeError("No se confirma Cuenta demo en la cabecera. Orden bloqueada.")
-        if "$" not in header.inner_text():
-            raise RuntimeError("Esta version de contabilidad solo admite la demo en dolares ($).")
+        validate_demo_header(validate_snapshot(
+            page.get_by_test_id("balanceAmount-Wrapper").evaluate_all(ELEMENT_SNAPSHOT),
+        ))
 
     def settings(self) -> Settings:
         page = self.page
         if page is None or page.is_closed():
             raise RuntimeError("Abre el navegador dedicado y selecciona cuenta demo.")
-        self.require_demo(page)
-        if urlparse(page.url).path != "/pwa/traderoom":
+        parsed = urlparse(page.url)
+        if parsed.scheme != "https" or parsed.hostname != "iqoption.com":
+            raise RuntimeError("Dominio de IQ Option no verificado.")
+        if parsed.path != "/pwa/traderoom":
             raise RuntimeError("Cierra la cartera y vuelve al grafico antes de armar.")
-        amount = page.get_by_test_id("amountSelector").inner_text()
+        started = time.perf_counter()
+        try:
+            controls = validate_snapshot(page.locator(
+                '[data-testid="balanceAmount-Wrapper"], [data-testid="amountSelector"], '
+                '[data-testid="expirationSelector"], [data-testid="positions-inspector"]',
+            ).evaluate_all(ELEMENT_SNAPSHOT))
+        finally:
+            LOGGER.info("Latencia configuracion cuenta/datos: %.3fs", time.perf_counter() - started)
+        validate_demo_header([
+            control for control in controls if control["test_id"] == "balanceAmount-Wrapper"
+        ])
+        texts: dict[str, str] = {}
+        for name in ("amountSelector", "expirationSelector", "positions-inspector"):
+            selected = [control for control in controls if control["test_id"] == name]
+            if len(selected) != 1:
+                raise RuntimeError(f"Control {name} ausente o ambiguo; entrada bloqueada.")
+            texts[name] = selected[0]["text"]
+        amount = texts["amountSelector"]
         match = re.fullmatch(r"Cantidad\s*\(\$\)\s*([\d,.]+)", amount.strip())
         if match is None:
             raise ValueError("No se pudo leer Cantidad ($); no se usara un importe por defecto.")
         stake = money(match.group(1))
         if stake <= 0:
             raise ValueError("El importe configurado debe ser positivo.")
-        expiry = page.get_by_test_id("expirationSelector").inner_text().strip()
+        expiry = texts["expirationSelector"].strip()
         if not re.search(r"\b\d{1,2}:\d{2}\b", expiry):
             raise ValueError("No se pudo leer el vencimiento seleccionado.")
-        inspector = page.get_by_test_id("positions-inspector")
-        asset = " ".join(inspector.inner_text().split())
+        asset = " ".join(texts["positions-inspector"].split())
         if "Binaria" not in asset:
             raise RuntimeError("Solo se permite el instrumento Binaria observado.")
-        timeframe = page.get_by_role("toolbar").get_by_role(
-            "button", name=re.compile(r"^(1m|5m)$"),
-        )
-        if timeframe.count() != 1 or not timeframe.is_visible():
+        started = time.perf_counter()
+        try:
+            timeframe = validate_snapshot(page.get_by_role("toolbar").get_by_role(
+                "button", name=re.compile(r"^(1m|5m)$"),
+            ).evaluate_all(ELEMENT_SNAPSHOT))
+        finally:
+            LOGGER.info("Latencia configuracion temporalidad: %.3fs", time.perf_counter() - started)
+        if len(timeframe) != 1 or not timeframe[0]["visible"]:
             raise RuntimeError("Selecciona un solo grafico con temporalidad 1m o 5m.")
-        label = timeframe.inner_text().strip()
+        label = timeframe[0]["text"].strip()
         if label not in ("1m", "5m"):
             raise RuntimeError("Temporalidad del grafico no interpretable.")
         period = 60 if label == "1m" else 300
         for name in ("Sube", "Baja"):
-            button = page.get_by_role("button", name=name, exact=True)
-            if button.count() != 1 or not button.is_visible() or not button.is_enabled():
+            started = time.perf_counter()
+            try:
+                button = validate_snapshot(page.get_by_role(
+                    "button", name=name, exact=True,
+                ).evaluate_all(ELEMENT_SNAPSHOT))
+            finally:
+                LOGGER.info("Latencia configuracion boton %s: %.3fs", name, time.perf_counter() - started)
+            if len(button) != 1 or not button[0]["visible"] or not button[0]["enabled"]:
                 raise RuntimeError(f"Boton {name} no disponible o ambiguo.")
         return Settings(asset, stake, expiry, period)
 
@@ -608,16 +698,18 @@ class DemoExecution:
             ) from exc
         return identity
 
-    def refresh(self) -> None:
+    def refresh(self) -> bool:
         pending = self.ledger.pending()
         if pending is None:
-            return
+            return False
         if pending["deadline"] is not None and time.time() < pending["deadline"]:
-            return
+            return False
         positions = self.browser.positions()
         self.ledger.reconcile(positions)
         self.baseline.update(p.identity for p in positions)
-        if self.ledger.is_closed_loss(pending["id"]):
+        recorded = self.ledger.is_closed(pending["id"])
+        if recorded and self.ledger.is_closed_loss(pending["id"]):
             self.session_losses += 1
             if self.session_losses >= 3:
                 self.armed = False
+        return recorded

@@ -39,6 +39,24 @@ def enable_physical_coordinates() -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def click_screen(point: tuple[int, int]) -> None:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    set_cursor = user32.SetCursorPos
+    set_cursor.argtypes = [ctypes.c_int, ctypes.c_int]
+    set_cursor.restype = wintypes.BOOL
+    x, y = point
+    if not set_cursor(x, y):
+        raise ctypes.WinError(ctypes.get_last_error())
+    mouse_event = user32.mouse_event
+    mouse_event.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_size_t,
+    ]
+    mouse_event.restype = None
+    mouse_event(0x0002, 0, 0, 0, 0)
+    mouse_event(0x0004, 0, 0, 0, 0)
+
+
 def list_monitors() -> list[Monitor]:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
 

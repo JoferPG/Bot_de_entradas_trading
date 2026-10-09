@@ -5,12 +5,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PIL import Image, ImageDraw, ImageFont
-from monitors import Monitor
+from monitors import Monitor, click_screen
 from demo_execution import EntryWindowExpired
 
 from bot import (
     App, COLORS, CSV_FIELDS, Detection, Selector, SignalGate,
-    TrackingUnavailable,
+    TrackingUnavailable, chart_background_click_point,
+    point_over_window,
     LOGGER, configure_diagnostics, current_candle_reference, detect, main, make_preview, parse_color,
     template_from, track_candle,
     white_price_point, write_event,
@@ -70,6 +71,27 @@ class RegionTests(unittest.TestCase):
     def test_local_box_must_fit_monitor(self):
         with self.assertRaises(ValueError):
             self.monitor.to_screen((0, 0, 401, 100))
+
+    def test_screen_click_sends_one_left_click_at_requested_physical_point(self):
+        user32 = Mock()
+        user32.SetCursorPos.return_value = True
+        with patch("monitors.ctypes.WinDLL", return_value=user32):
+            click_screen((-500, 250))
+        user32.SetCursorPos.assert_called_once_with(-500, 250)
+        self.assertEqual(user32.mouse_event.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in user32.mouse_event.call_args_list],
+            [0x0002, 0x0004],
+        )
+
+    def test_screen_click_reports_cursor_position_failure_before_pressing(self):
+        user32 = Mock()
+        user32.SetCursorPos.return_value = False
+        with patch("monitors.ctypes.WinDLL", return_value=user32), patch(
+            "monitors.ctypes.get_last_error", return_value=5,
+        ), self.assertRaises(OSError):
+            click_screen((100, 200))
+        user32.mouse_event.assert_not_called()
 
     def test_reset_statistics_keeps_execution_safety_state(self):
         self.app.ledger = Mock()
@@ -853,6 +875,22 @@ class VisualTests(unittest.TestCase):
             for signal in ("CALL", "PUT")
         }
 
+    def test_overlay_cleanup_point_uses_only_unobstructed_dark_chart_background(self):
+        image = Image.new("RGB", (400, 300), "#0b1427")
+        ImageDraw.Draw(image).rectangle((0, 200, 399, 299), fill="#643044")
+        ImageDraw.Draw(image).rectangle((150, 210, 175, 260), fill="#00c853")
+        point = chart_background_click_point(image, (100, 200, 500, 500))
+        self.assertIsNotNone(point)
+        self.assertTrue(100 <= point[0] < 500)
+        self.assertTrue(200 <= point[1] < 500)
+        self.assertEqual(image.getpixel((point[0] - 100, point[1] - 200)), (11, 20, 39))
+
+    def test_overlay_cleanup_refuses_colored_or_mismatched_screenshots(self):
+        image = Image.new("RGB", (400, 300), "#6b3038")
+        self.assertIsNone(chart_background_click_point(image, (0, 0, 400, 300)))
+        with self.assertRaisesRegex(ValueError, "no coincide"):
+            chart_background_click_point(image, (10, 0, 400, 300))
+
     def test_fragmented_arrows_preserve_visible_size_and_score(self):
         for signal in ("CALL", "PUT"):
             for slit in ((14, 10, 16, 33), (10, 21, 26, 23)):
@@ -1160,6 +1198,88 @@ class GateTests(unittest.TestCase):
             gate.observe(9, None)
         with self.assertRaises(ValueError):
             gate.observe(float("nan"), None)
+
+
+class ResultCleanupTests(unittest.TestCase):
+    def make_app(self, recorded=True):
+        app = App.__new__(App)
+        app.result_job = None
+        app.region = (100, 200, 500, 500)
+        app.root = Mock()
+        app.root.winfo_rootx.return_value = -1000
+        app.root.winfo_rooty.return_value = -1000
+        app.root.winfo_width.return_value = 400
+        app.root.winfo_height.return_value = 800
+        app.execution = Mock()
+        app.execution.refresh.return_value = recorded
+        app.execution.armed = True
+        app.execution.session_losses = 0
+        app.ledger = Mock()
+        app.ledger.pending.return_value = None
+        app.ledger.summary.return_value = "Ganadas: 0"
+        app.order_status = Mock()
+        app.summary_text = Mock()
+        app.schedule_results = Mock()
+        return app
+
+    def test_click_happens_only_after_closed_result_is_recorded(self):
+        app = self.make_app()
+        image = Image.new("RGB", (400, 300), "#0b1427")
+        with (
+            patch("bot.ImageGrab.grab", return_value=image) as grab,
+            patch("bot.click_screen") as click,
+        ):
+            App.refresh_results(app)
+        grab.assert_called_once_with(bbox=app.region, all_screens=True)
+        click.assert_called_once()
+        app.order_status.set.assert_called_once()
+        self.assertIn("Velo del grafico limpiado", app.order_status.set.call_args.args[0])
+
+    def test_open_or_unknown_result_never_clicks_chart(self):
+        app = self.make_app(recorded=False)
+        with (
+            patch("bot.ImageGrab.grab") as grab,
+            patch("bot.click_screen") as click,
+        ):
+            App.refresh_results(app)
+        grab.assert_not_called()
+        click.assert_not_called()
+
+    def test_no_safe_background_skips_click_and_reports_manual_cleanup(self):
+        app = self.make_app()
+        image = Image.new("RGB", (400, 300), "#803040")
+        with (
+            patch("bot.ImageGrab.grab", return_value=image),
+            patch("bot.click_screen") as click,
+        ):
+            App.refresh_results(app)
+        click.assert_not_called()
+        self.assertIn("No se limpio el velo", app.order_status.set.call_args.args[0])
+        self.assertIsNone(app.ledger.pending())
+
+    def test_overlay_click_is_skipped_if_the_topmost_bot_window_covers_target(self):
+        app = self.make_app()
+        app.root.winfo_rootx.return_value = 100
+        app.root.winfo_rooty.return_value = 200
+        image = Image.new("RGB", (400, 300), "#0b1427")
+        with (
+            patch("bot.ImageGrab.grab", return_value=image),
+            patch("bot.click_screen") as click,
+        ):
+            App.refresh_results(app)
+        click.assert_not_called()
+        self.assertIn("mueve el panel fuera del grafico", app.order_status.set.call_args.args[0])
+
+    def test_window_overlap_uses_physical_bounds(self):
+        window = Mock()
+        window.winfo_rootx.return_value = 100
+        window.winfo_rooty.return_value = 200
+        window.winfo_width.return_value = 470
+        window.winfo_height.return_value = 850
+        self.assertTrue(point_over_window((100, 200), window))
+        self.assertTrue(point_over_window((569, 1049), window))
+        self.assertFalse(point_over_window((570, 1050), window))
+        self.assertFalse(point_over_window((99, 200), window))
 
 
 class LogTests(unittest.TestCase):

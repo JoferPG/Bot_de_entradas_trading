@@ -14,6 +14,13 @@ from demo_execution import (
 from playwright.sync_api import TimeoutError as BrowserTimeoutError
 
 
+def snapshot(text="", test_id="", container="Cuenta demo $100", visible=True, enabled=True):
+    return {
+        "test_id": test_id, "text": text, "container_text": container,
+        "visible": visible, "enabled": enabled,
+    }
+
+
 class DemoTests(unittest.TestCase):
     @patch("demo_execution.sync_playwright")
     def test_opens_dedicated_edge_without_firefox(self, factory):
@@ -119,28 +126,21 @@ class DemoTests(unittest.TestCase):
         browser.page = Mock()
         browser.page.url = "https://iqoption.com/pwa/traderoom"
         browser.page.is_closed.return_value = False
-        texts = {
-            "amountSelector": "Cantidad ($) 20",
-            "expirationSelector": "Tiempo 21:10",
-            "positions-inspector": self.settings.asset,
-        }
-        browser.page.get_by_test_id.side_effect = lambda name: Mock(
-            inner_text=Mock(return_value=texts[name]),
-        )
+        browser.page.locator.return_value.evaluate_all.return_value = [
+            snapshot("$100", "balanceAmount-Wrapper"),
+            snapshot("Cantidad ($) 20", "amountSelector"),
+            snapshot("Tiempo 21:10", "expirationSelector"),
+            snapshot(self.settings.asset, "positions-inspector"),
+        ]
         buttons = browser.page.get_by_role.return_value
-        buttons.count.return_value = 1
-        buttons.is_visible.return_value = True
-        buttons.is_enabled.return_value = True
+        buttons.evaluate_all.return_value = [snapshot("Sube")]
         timeframe = buttons.get_by_role.return_value
-        timeframe.count.return_value = 1
-        timeframe.is_visible.return_value = True
-        with patch.object(browser, "require_demo"):
-            for label, period in (("1m", 60), ("5m", 300)):
-                timeframe.inner_text.return_value = label
-                self.assertEqual(browser.settings().period, period)
-            timeframe.count.return_value = 0
-            with self.assertRaisesRegex(RuntimeError, "temporalidad"):
-                browser.settings()
+        for label, period in (("1m", 60), ("5m", 300)):
+            timeframe.evaluate_all.return_value = [snapshot(label)]
+            self.assertEqual(browser.settings().period, period)
+        timeframe.evaluate_all.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "temporalidad"):
+            browser.settings()
 
     def test_changed_chart_timeframe_blocks_entry(self):
         self.execution.arm()
@@ -460,6 +460,21 @@ class DemoTests(unittest.TestCase):
         self.assertIn("Ingresos: $37.40", self.ledger.summary())
         self.assertIn("Perdidas: $0.00", self.ledger.summary())
 
+    def test_refresh_reports_only_when_closed_result_is_registered(self):
+        self.execution.arm()
+        self.execution.submit("CALL", time.time(), 300)
+        pending = self.ledger.pending()
+        with patch("demo_execution.time.time", return_value=pending["deadline"] + 1):
+            self.browser.positions.return_value = [self.position(closed=False)]
+            self.assertFalse(self.execution.refresh())
+            self.assertIsNotNone(self.ledger.pending())
+            self.browser.positions.return_value = [
+                self.position(closed=True, returned=Decimal("37.40")),
+            ]
+            self.assertTrue(self.execution.refresh())
+        self.assertIsNone(self.ledger.pending())
+        self.assertFalse(self.execution.refresh())
+
     def test_click_failure_is_persistent_unknown_and_never_retried(self):
         self.execution.arm()
         self.browser.click_once.side_effect = RuntimeError("Timeout")
@@ -719,15 +734,13 @@ class DemoTests(unittest.TestCase):
     def test_real_account_or_menu_ambiguity_rejected(self):
         page = Mock()
         page.url = "https://iqoption.com/pwa/traderoom"
-        header = page.get_by_test_id.return_value.filter.return_value
-        header.count.return_value = 1
-        header.inner_text.return_value = "$100"
-        header.locator.return_value.inner_text.return_value = "Cuenta real $100"
+        header = page.get_by_test_id.return_value
+        header.evaluate_all.return_value = [snapshot("$100", container="Cuenta real $100")]
         with self.assertRaisesRegex(RuntimeError, "demo"):
             DemoBrowser.require_demo(page)
-        header.locator.return_value.inner_text.return_value = "Cuenta demo $100"
+        header.evaluate_all.return_value = [snapshot("$100")]
         DemoBrowser.require_demo(page)
-        header.count.return_value = 2
+        header.evaluate_all.return_value = [snapshot("$100"), snapshot("$100")]
         with self.assertRaises(RuntimeError):
             DemoBrowser.require_demo(page)
 
